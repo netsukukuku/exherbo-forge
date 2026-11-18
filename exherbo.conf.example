@@ -1,0 +1,138 @@
+# vim: set ft=sh ts=4 sw=4 sts=-1 noet:
+# This file will be interpreted by /bin/bash.
+#
+# Copy it to exherbo.conf and edit it, or just run ./configure which writes this file for you.
+
+################################################
+# Disk configuration
+#
+# Exherbo Forge supports EFI (UEFI) installs on a single disk with ext4 or btrfs.
+# Disk encryption, RAID and ZFS are not supported yet.
+# Be sure to only define one layout!
+
+function disk_configuration() {
+	create_classic_single_disk_layout swap=auto type=efi luks=false root_fs=btrfs subvolumes=true /dev/sdX
+
+	# 1. create_classic_single_disk_layout
+	#
+	# The usual scheme on one disk: a 1 GiB EFI system partition (mounted at /boot, the kernel and
+	# initramfs live there), an optional swap partition and a root partition.
+	#
+	# Parameters:
+	#   swap=<size>              Swap partition size (e.g. 8GiB), false for none, or "auto" to size it
+	#                            from the RAM of the installing machine (<=2GiB RAM: 2x, <=8GiB: 1x, more: 8GiB).
+	#   type=efi                 The boot type. Only efi is supported.
+	#   luks=false               Not supported yet.
+	#   root_fs=[ext4|btrfs]     Root filesystem.
+	#   subvolumes=[true|false]  (btrfs only) Create the subvolumes home, snapshots, log and cache and
+	#                            mount them at /home, /.snapshots, /var/log and /var/cache.
+	#
+	# 2. create_manual_layout
+	#
+	# A single disk with a freely defined partition list, see the "Custom partitioning" menu in ./configure:
+	#create_manual_layout type=efi parts="8GiB:swap:swap;50GiB:/:ext4;remaining:/home:ext4" /dev/sdX
+	#
+	# 3. create_existing_partitions_layout
+	#
+	# Use partitions you created yourself (see scripts/config.sh for the parameters).
+}
+
+
+################################################
+# System configuration
+
+HOSTNAME="exherbo"
+
+# The timezone as a name below /usr/share/zoneinfo, e.g. "Europe/Berlin".
+TIMEZONE="Europe/London"
+
+# The console keymap, e.g. "us", "de-latin1".
+KEYMAP="us"
+
+# The keymap used in the initramfs (usually the same).
+KEYMAP_INITRAMFS="$KEYMAP"
+
+# Locales to generate with localedef, one "name charset" pair per line, e.g.
+#   LOCALES="en_US.UTF-8 UTF-8"
+# The first part before the dot is the input locale, the rest is the name.
+LOCALES="en_US.UTF-8 UTF-8"
+
+# The default locale, as it appears in the list above (or C.utf8).
+LOCALE="en_US.UTF-8"
+
+
+################################################
+# Accounts (passwords are stored as salted SHA-512 hashes, never in clear text)
+
+# How the root account is handled: set (use ROOT_PASSWORD_HASH), ask (you are asked during the
+# install) or locked (no root login, administration via sudo).
+ROOT_PASSWORD_MODE="set"
+ROOT_PASSWORD_HASH=""
+
+# A regular user. Leave USER_NAME empty to skip. Generate a hash with: openssl passwd -6
+USER_NAME=""
+USER_PASSWORD_HASH=""
+USER_SUDO=true
+
+
+################################################
+# Boot loader, desktop
+
+# systemd-boot (default) or grub. Both are installed on the EFI system partition at /boot.
+BOOTLOADER="systemd-boot"
+
+# none, or plasma (KDE Plasma via 'cave resolve plasma'). Everything is compiled from source:
+# Plasma takes many hours.
+DESKTOP="none"
+
+# auto or sddm.
+DISPLAY_MANAGER="auto"
+
+
+################################################
+# Network
+
+# wired (systemd-networkd), iwd (Wi-Fi via iwctl + ethernet) or networkmanager.
+# If the Wi-Fi or NetworkManager package cannot be installed, the install continues with wired DHCP.
+NETWORK_BACKEND="iwd"
+
+# Copy the Wi-Fi networks you joined with iwctl in the live system (iwd only).
+COPY_LIVE_WIFI=true
+
+# Wired setup (systemd-networkd).
+SYSTEMD_NETWORKD_INTERFACE_NAME="en*"
+SYSTEMD_NETWORKD_DHCP=true
+SYSTEMD_NETWORKD_ADDRESSES=("192.168.1.100/32" "fd00::1/64")
+SYSTEMD_NETWORKD_GATEWAY="192.168.1.1"
+
+
+################################################
+# Exherbo configuration
+
+# The stage tarball. Exherbo publishes a rolling "current" stage; a .sha256sum file next to it is checked.
+EXHERBO_STAGE_URL="https://stages.exherbo.org/x86_64-pc-linux-gnu/exherbo-x86_64-pc-linux-gnu-gcc-current.tar.xz"
+
+# Extra repositories to configure (each one is synced from https://gitlab.exherbo.org/exherbo/<name>.git).
+EXHERBO_REPOSITORIES="hardware x11 desktop net kde python media perl"
+
+# How the kernel is configured. Exherbo has no distribution kernel: the latest stable kernel is
+# built during the install, based on the configuration of the running live system.
+#   live  keep only the modules the live system is using (localmodconfig): fast, matches this machine
+#   full  keep the live system's full module set: hardware-complete but a much longer build
+KERNEL_CONFIG="live"
+
+SYSTEMD=true
+
+
+################################################
+# Additional (optional) configuration
+
+# Packages installed with cave at the end, e.g. ADDITIONAL_PACKAGES=("htop" "git").
+ADDITIONAL_PACKAGES=()
+
+
+################################################
+# Prove that you have read the config
+
+# Set this to true after you have edited the file.
+I_HAVE_READ_AND_EDITED_THE_CONFIG_PROPERLY=false

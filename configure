@@ -1,0 +1,2363 @@
+#!/bin/bash
+set -uo pipefail
+
+
+################################################
+# Initialize script environment
+
+# Find the directory this script is stored in. (from: http://stackoverflow.com/questions/59895)
+function get_source_dir() {
+	local source="${BASH_SOURCE[0]}"
+	while [[ -h $source ]]; do
+		local tmp
+		tmp="$(cd -P "$(dirname "${source}")" && pwd)"
+		source="$(readlink "${source}")"
+		[[ $source != /* ]] && source="${tmp}/${source}"
+	done
+
+	echo -n "$(realpath "$(dirname "${source}")")"
+}
+
+GENTOO_INSTALL_REPO_DIR="$(get_source_dir)"
+export GENTOO_INSTALL_REPO_DIR
+export GENTOO_INSTALL_REPO_SCRIPT_ACTIVE=true
+
+# shellcheck source=./scripts/utils.sh
+source "$GENTOO_INSTALL_REPO_DIR/scripts/utils.sh"
+
+# Remember actual config file path
+CONFIG_FILE="$(realpath "${1-"exherbo.conf"}" 2>/dev/null)"
+RELA_CONFIG_FILE="$(realpath --relative-to="$(pwd)" "$CONFIG_FILE" 2>/dev/null)"
+
+# Check if help is requested
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		""|"help"|"--help"|"-help"|"-h")
+			echo "Usage: $0 [config]"
+			echo "Starts the Exherbo configurator. If no file is given, it defaults to 'exherbo.conf'."
+			echo "If the file doesn't exist, the configurator loads default values, otherwise, the"
+			echo "the configuration is loaded into the configurator."
+			exit 0
+			;;
+	esac
+	shift
+done
+
+check_wanted_programs dialog ncurses=ncursesw6-config
+
+# Gentoo theme (purple/lavender). Disable with GENTOO_INSTALL_NO_THEME=1.
+if [[ ${GENTOO_INSTALL_NO_THEME:-0} != 1 ]]; then
+	export DIALOGRC="$GENTOO_INSTALL_REPO_DIR/contrib/exherbo.dialogrc"
+	gentoo_theme_apply
+fi
+
+# Determine whether EFI is available
+HAS_EFI_SUPPORT=$([[ -d /sys/firmware/efi ]] && echo -n "true" || echo -n "false")
+DEFAULT_BOOT_TYPE="efi"  # the Exherbo installer only supports EFI
+EFI_UNSUPPORTED_MESSAGE_SHORT="Missing EFI support on this system!"
+EFI_UNSUPPORTED_MESSAGE="Apparently, your system does NOT support efi. Double-check before proceeding!"
+
+# Wrap dialog in two functions to prevent it from cluttering stderr.
+BACKTITLE="Exherbo Forge"
+function dialog_wrapper() { dialog_out=$(command dialog --colors --backtitle "$BACKTITLE" "$@" 3>&2 2>&1 1>&3 3>&-); }
+function dialog() { dialog_wrapper "$@" 2>&1; }
+
+
+################################################
+# Configuration helper functions
+
+function get_timezone() {
+	local file
+	if file="$(readlink /etc/localtime)"; then
+		# /etc/localtime is a symlink as expected
+		local timezone
+		timezone=${file#*zoneinfo/}
+		if [[ $timezone == "$file" ]]; then
+			# not pointing to expected location or not Region/City
+			echo "Europe/London"
+		else
+			echo "$timezone"
+		fi
+	else
+		# compare files by contents
+		find /usr/share/zoneinfo -type f -exec cmp -s {} /etc/localtime \; -print \
+			| sed -e 's,.*/zoneinfo/,,' \
+			| head -1
+	fi
+}
+
+function get_default_keymap() {
+	local keymap
+	keymap="$(grep KEYMAP /etc/vconsole.conf 2>/dev/null || echo "KEYMAP=us")"
+	keymap="${keymap#KEYMAP=}"
+
+	local map
+	for map in "${ALL_KEYMAPS[@]}"; do
+		if [[ $map == "$keymap" ]]; then
+			echo -n "${keymap}"
+			return
+		fi
+	done
+
+	# Fallback to us
+	echo -n "us"
+}
+
+function get_all_keymaps() {
+	ALL_KEYMAPS=()
+	local map
+	for map in $(find /usr/share/keymaps/ /usr/share/kbd/keymaps/ -type f -iname '*.map.gz' -printf "%f\n" 2>/dev/null | sort -u); do
+		ALL_KEYMAPS+=("${map%%.map.gz}")
+	done
+}
+
+function get_all_timezones() {
+	readarray -t ALL_TIMEZONES < <(find /usr/share/zoneinfo -type f -printf "%P\n" | sort -u)
+}
+
+function recalculate_locales() {
+	LOCALES=""
+	N_LOCALES=0
+
+	local selected_index_list="$SELECTED_LOCALES"
+	local next_selected
+	next_selected="${selected_index_list%% *}"
+	selected_index_list="${selected_index_list#* }"
+
+	local i=0
+	for item in "${SUPPORTED_LOCALES[@]}"; do
+		if [[ "$i" == "$next_selected" ]]; then
+			LOCALES="$LOCALES"$'\n'"$item"
+			next_selected="${selected_index_list%% *}"
+			selected_index_list="${selected_index_list#* }"
+			((++N_LOCALES))
+		fi
+		((++i))
+	done
+
+	LOCALES="${LOCALES:1}"
+}
+
+function define_disk_configuration_function() {
+	cat << EOF
+function disk_configuration() {
+	$* ;
+}
+EOF
+}
+
+function define_swap() {
+	if [[ $PARTITIONING_USE_SWAP == "true" ]]; then
+		echo -n "${PARTITIONING_SWAP@Q}"
+	else
+		echo -n "false"
+	fi
+}
+
+function define_zfs_compression() {
+	if [[ $PARTITIONING_ZFS_USE_COMPRESSION != "false" ]]; then
+		echo -n "${PARTITIONING_ZFS_COMPRESSION@Q}"
+	else
+		echo -n "false"
+	fi
+}
+
+function define_disk_layout() {
+	local swapdev
+	local manual_parts
+	manual_parts="$(IFS=';'; echo -n "${PARTITIONING_MANUAL_PARTS[*]}")"
+	case "$PARTITIONING_SCHEME" in
+		"classic_single_disk") define_disk_configuration_function "create_classic_single_disk_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} luks=${PARTITIONING_USE_LUKS@Q} root_fs=${PARTITIONING_ROOT_FS@Q} subvolumes=$([[ $PARTITIONING_ROOT_FS == btrfs ]] && echo -n "${PARTITIONING_BTRFS_SUBVOLUMES@Q}" || echo -n false)" "${PARTITIONING_DEVICE@Q}" ;;
+		"manual")              define_disk_configuration_function "create_manual_layout type=${PARTITIONING_BOOT_TYPE@Q} boot_size=${PARTITIONING_MANUAL_BOOT_SIZE@Q} parts=${manual_parts@Q}" "${PARTITIONING_DEVICE@Q}" ;;
+		"existing_partitions")
+			if [[ "$PARTITIONING_USE_SWAP" ]]; then
+				swapdev=${PARTITIONING_SWAP_DEVICE:-false}
+			else
+				swapdev=false
+			fi
+		    define_disk_configuration_function "create_existing_partitions_layout boot=${PARTITIONING_BOOT_DEVICE@Q} swap=${swapdev@Q} type=${PARTITIONING_BOOT_TYPE@Q}" "${PARTITIONING_DEVICE@Q}" ;;
+		"zfs_centric")         define_disk_configuration_function "create_zfs_centric_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} encrypt=${PARTITIONING_ZFS_USE_ENCRYPTION@Q} compress=$(define_zfs_compression) pool_type=${PARTITIONING_ZFS_POOL_TYPE@Q}" "${PARTITIONING_DEVICES[@]@Q}" ;;
+		"btrfs_centric")       define_disk_configuration_function "create_btrfs_centric_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} raid_type=${PARTITIONING_BTRFS_RAID_TYPE@Q} luks=${PARTITIONING_USE_LUKS@Q}" "${PARTITIONING_DEVICES[@]@Q}" ;;
+		"raid0_luks")          define_disk_configuration_function "create_raid0_luks_layout swap=$(define_swap) type=${PARTITIONING_BOOT_TYPE@Q} root_fs=${PARTITIONING_ROOT_FS@Q}" "${PARTITIONING_DEVICES[@]@Q}" ;;
+		"custom")
+			# Show current function declaration, trim trailing whitespace
+			declare -f disk_configuration \
+				| sed -e 's/\s*$//'
+			;;
+	esac
+}
+
+
+ALL_PARTITIONING_SCHEMES=(
+	"classic_single_disk" "Recommended: one disk, auto-sized (boot, swap, root with btrfs subvolumes or ext4)"
+	"manual"              "Custom partitioning: design your own partition list (one disk)"
+	"existing_partitions" "Skip partitioning, use existing pre-formatted partitions"
+	"custom"              "Expert: edit the disk configuration in the config file by hand"
+)
+
+PARTITIONING_BTRFS_SUBVOLUMES=true
+PARTITIONING_MANUAL_PARTS=()
+PARTITIONING_MANUAL_BOOT_SIZE="1GiB"
+PLAN_PROBLEMS=()
+
+PARTITIONING_BOOT_TYPES=(
+	"efi" "efi$([[ $HAS_EFI_SUPPORT == true ]] && echo -n "" || echo -n " (!! $EFI_UNSUPPORTED_MESSAGE_SHORT !!)")"
+)
+PARTITIONING_ROOT_FS_TYPES=("ext4" "btrfs")
+PARTITIONING_BTRFS_RAID_TYPES=("raid0" "raid1")
+PARTITIONING_ZFS_POOL_TYPES=("standard" "custom")
+PARTITIONING_ZFS_COMPRESSIONS=("on" "gzip" "lz4" "lzjb" "zle" "zstd" "zstd-fast")
+
+
+function create_single_disk_layout() {
+	create_classic_single_disk_layout "$@"
+}
+
+function parse_swap() {
+	if [[ $1 == "false" ]]; then
+		PARTITIONING_USE_SWAP=false
+		PARTITIONING_SWAP=8GiB
+	else
+		PARTITIONING_USE_SWAP=true
+		PARTITIONING_SWAP="$1"
+	fi
+}
+
+function parse_zfs_compression() {
+	if [[ $1 == "false" ]]; then
+		PARTITIONING_ZFS_USE_COMPRESSION=false
+		PARTITIONING_ZFS_COMPRESSION=zstd
+	else
+		PARTITIONING_ZFS_USE_COMPRESSION=true
+		PARTITIONING_ZFS_COMPRESSION="$1"
+	fi
+}
+
+function create_classic_single_disk_layout() {
+	PARTITIONING_SCHEME="classic_single_disk"
+
+	local known_arguments=('+swap' '?type' '?luks' '?root_fs' '?subvolumes')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICE="${extra_arguments[0]}"
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_USE_LUKS="${arguments[luks]:-false}"
+	PARTITIONING_ROOT_FS="${arguments[root_fs]:-ext4}"
+	PARTITIONING_BTRFS_SUBVOLUMES="${arguments[subvolumes]:-false}"
+}
+
+function create_manual_layout() {
+	PARTITIONING_SCHEME="manual"
+
+	local known_arguments=('+parts' '?type' '?boot_size')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICE="${extra_arguments[0]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]:-efi}"
+	PARTITIONING_MANUAL_BOOT_SIZE="${arguments[boot_size]:-1GiB}"
+	PARTITIONING_MANUAL_PARTS=()
+	IFS=';' read -ra PARTITIONING_MANUAL_PARTS <<< "${arguments[parts]}"
+}
+
+function create_existing_partitions_layout() {
+	PARTITIONING_SCHEME="existing_partitions"
+
+	local known_arguments=('+swap' '+boot' '?type')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICE="${extra_arguments[0]}"
+	if [[ "${arguments[swap]}" == "false" ]]; then
+		PARTITIONING_USE_SWAP=false
+		PARTITIONING_SWAP_DEVICE=""
+	else
+		PARTITIONING_USE_SWAP=true
+		PARTITIONING_SWAP_DEVICE="${arguments[swap]}"
+	fi
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_BOOT_DEVICE="${arguments[boot]}"
+}
+
+function create_raid0_luks_layout() {
+	PARTITIONING_SCHEME="raid0_luks"
+
+	local known_arguments=('+swap' '?type' '?root_fs')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICES=("${extra_arguments[@]}")
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_ROOT_FS="${arguments[root_fs]:-ext4}"
+}
+
+function create_zfs_centric_layout() {
+	PARTITIONING_SCHEME="zfs_centric"
+
+	local known_arguments=('+swap' '?type' '?pool_type' '?encrypt' '?compress')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICES=("${extra_arguments[@]}")
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_ZFS_POOL_TYPE="${arguments[pool_type]:-standard}"
+	PARTITIONING_ZFS_USE_ENCRYPTION="${arguments[encrypt]:-false}"
+	parse_zfs_compression "${arguments[compress]:-false}"
+}
+
+function create_btrfs_raid_layout() {
+	create_btrfs_centric_layout "$@"
+}
+
+function create_btrfs_centric_layout() {
+	PARTITIONING_SCHEME="btrfs_centric"
+
+	# shellcheck disable=SC2034
+	local known_arguments=('+swap' '?type' '?raid_type' '?luks')
+	local extra_arguments=()
+	declare -A arguments; parse_arguments "$@"
+
+	PARTITIONING_DEVICES=("${extra_arguments[@]}")
+	parse_swap "${arguments[swap]}"
+	PARTITIONING_BOOT_TYPE="${arguments[type]}"
+	PARTITIONING_USE_LUKS="${arguments[luks]:-false}"
+	PARTITIONING_BTRFS_RAID_TYPE="${arguments[raid_type]:-raid0}"
+}
+
+
+################################################
+# Configuration constants
+
+get_all_keymaps
+get_all_timezones
+readarray -t SUPPORTED_LOCALES < "$GENTOO_INSTALL_REPO_DIR/contrib/i18n_supported"
+readarray -t LOCALE_A < <(locale -a)
+
+
+################################################
+# Load/Default configuration
+
+function load_selected_locales() {
+	local sel_locales=()
+	local IFS=$'\n'
+	declare -A selected_by_name
+	for i in $LOCALES; do
+		selected_by_name["$i"]=true
+	done
+
+	local i=0
+	for item in "${SUPPORTED_LOCALES[@]}"; do
+		[[ "${selected_by_name[$item]:-}" == true ]] \
+			&& sel_locales+=("$i")
+		((++i))
+	done
+
+	local IFS=" "
+	SELECTED_LOCALES="${sel_locales[*]}"
+}
+
+function process_config() {
+	disk_configuration
+
+	if [[ "$KEYMAP" == "$KEYMAP_INITRAMFS" ]]; then
+		KEYMAP_INITRAMFS_OTHER=false
+	else
+		KEYMAP_INITRAMFS_OTHER=true
+	fi
+
+	load_selected_locales
+	recalculate_locales
+}
+
+function load_config() {
+	# First load defaults, then replace by sourcing config.
+	load_default_config
+
+	# Fallback to custom partitioning scheme if it isn't set in the actual config
+	PARTITIONING_SCHEME="custom"
+
+	# Load settings
+	# shellcheck disable=SC1090
+	source "$1" || die "Could not load given configuration."
+
+	# After loading a config no unsaved changes exist.
+	UNSAVED_CHANGES=false
+}
+
+function load_default_config() {
+	HOSTNAME="exherbo"
+	TIMEZONE="$(get_timezone)"
+	KEYMAP="$(get_default_keymap)"
+	KEYMAP_INITRAMFS="$KEYMAP"
+	LOCALES="en_US.UTF-8 UTF-8"
+	LOCALE="en_US.UTF-8"
+
+	NETWORK_BACKEND="iwd"
+	COPY_LIVE_WIFI=true
+	SYSTEMD_NETWORKD_INTERFACE_NAME="en*"
+	SYSTEMD_NETWORKD_DHCP=true
+	SYSTEMD_NETWORKD_ADDRESSES=("192.168.1.100/32" "fd00::1/64")
+	SYSTEMD_NETWORKD_GATEWAY="192.168.1.1"
+
+	ROOT_PASSWORD_MODE="set"
+	ROOT_PASSWORD_HASH=""
+	USER_NAME=""
+	USER_PASSWORD_HASH=""
+	USER_SUDO=true
+
+	BOOTLOADER="systemd-boot"
+	DESKTOP="none"
+	DISPLAY_MANAGER="auto"
+
+	function disk_configuration() {
+		#create_zfs_centric_layout swap=8GiB type="$DEFAULT_BOOT_TYPE" encrypt=true compress=zstd pool_type=standard /dev/sdX
+		create_classic_single_disk_layout swap=auto type="$DEFAULT_BOOT_TYPE" luks=false root_fs=btrfs subvolumes=true /dev/sdX
+	}
+
+	STAGE3_VARIANT="systemd"
+	EXHERBO_STAGE_URL="https://stages.exherbo.org/x86_64-pc-linux-gnu/exherbo-x86_64-pc-linux-gnu-gcc-current.tar.xz"
+	EXHERBO_REPOSITORIES="hardware x11 desktop net kde python media perl"
+	KERNEL_CONFIG="live"
+
+
+
+	ADDITIONAL_PACKAGES=()
+
+	# All settings are unsaved.
+	UNSAVED_CHANGES=true
+}
+
+SAVE_AS_FILENAME="$RELA_CONFIG_FILE"
+if [[ -e "$CONFIG_FILE" ]]; then
+	load_config "$CONFIG_FILE"
+else
+	load_default_config
+fi
+process_config
+
+
+################################################
+# Menu helpers and constants
+
+# $1: exit code
+function clear_and_exit() {
+	dialog --clear
+	gentoo_theme_reset
+	clear -x
+	exit "$1"
+}
+
+function ellipsis() {
+	local len="$1"
+	shift
+	local str="$*"
+	if [[ "${#str}" -gt "$len" ]]; then
+		echo "${str:0:$len}…"
+	else
+		echo "$str"
+	fi
+}
+
+function on_off_toggle() {
+	if [[ "${!1}" == true ]]; then
+		declare -g "$1"=false
+	else
+		declare -g "$1"=true
+	fi
+}
+
+function on_off_str() {
+	if [[ "$1" == true ]]; then
+		echo -n "$2"
+	else
+		echo -n "$3"
+	fi
+}
+
+function on_off_label() {
+	local prefix="${2:-}"
+	on_off_str "$1" "${prefix}[*]" "${prefix}[ ]"
+}
+
+function on_off_label_inverted() {
+	local var=$1
+	shift
+	on_off_label "$(is_on "$var" && echo false || echo true)" "$@"
+}
+
+function is_on() {
+	[[ "$1" == true ]]
+}
+
+function is_off() {
+	[[ "$1" != true ]]
+}
+
+# if $1 is in $2..
+function one_of() {
+	local what="$1"
+	shift
+	for i in "$@"; do
+		[[ "$i" == "$what" ]] \
+			&& return 0
+	done
+	return 1
+}
+
+# $1: title
+# $2: description
+# $3: space separated index list of selected items (e.g. "0 1 5 6")
+# $@: all items
+function menu_splitlist() {
+	local title="$1"
+	local description="$2"
+	local selected_index_list="$3"
+	shift 3
+
+	# Build option array
+	local items=()
+	local item
+	local i=0
+	local next_selected="${selected_index_list%% *}"
+	local selected_index_list="${selected_index_list#* }"
+	for item in "$@"; do
+		if [[ "$i" == "$next_selected" ]]; then
+			items+=("$i" "$item" "on")
+			next_selected="${selected_index_list%% *}"
+			selected_index_list="${selected_index_list#* }"
+		else
+			items+=("$i" "$item" "off")
+		fi
+		((++i))
+	done
+
+	# Show selection dialog
+	dialog \
+		--title "$title" \
+		--buildlist "$description\nUse ^ to focus the list of unselected items and $ to focus the list of selected items. Use <Space> to select/deselect an item and select <OK> by pressing <Enter> when finished." \
+		"${BUILDLIST_SIZE[@]}" "${items[@]}"
+
+	local diag_exit=$?
+	if [[ $diag_exit == 0 ]]; then
+		# <OK>
+		return 0
+	elif [[ $diag_exit == 1 ]]; then
+		# <Cancel>
+		return 1
+	else
+		# <ESC><ESC>
+		return 1
+	fi
+}
+
+# $1: title
+# $2: description
+# $3: default item
+# $@: [tag label]...
+function menu_radiolist_labeled() {
+	local title="$1"
+	local description="$2"
+	local default_item="$3"
+	shift 3
+
+	# Build option array
+	local items=()
+	local tag
+	local label
+	while [[ "$#" -gt 0 ]]; do
+		tag="$1"
+		label="$2"
+		shift 2
+
+		if [[ $tag == "$default_item" ]]; then
+			items+=("$tag" "$label" "on")
+		else
+			items+=("$tag" "$label" "off")
+		fi
+	done
+
+	# Show selection dialog
+	dialog \
+		--no-tags \
+		--title "$title" \
+		--help-button \
+		--help-label "Select" \
+		--help-status \
+		--ok-label "OK" \
+		--default-item "$default_item" \
+		--default-button help \
+		--radiolist "$description\nUse <Select> to select the option under the cursor, or <OK> to use the option which is selected with an asterisk." \
+		"${RADIOLIST_SIZE[@]}" "${items[@]}"
+
+	local diag_exit=$?
+	if [[ $diag_exit == 0 ]]; then
+		# <OK>
+		return 0
+	elif [[ $diag_exit == 1 ]]; then
+		# <Cancel>
+		return 1
+	elif [[ $diag_exit == 2 ]]; then
+		# <Select>
+		local sel="${dialog_out#HELP }"
+		local sel_cur="${sel% *}"
+		#local sel_radio="${sel#* }"
+		dialog_out="$sel_cur"
+		return 0
+	else
+		# <ESC><ESC>
+		return 1
+	fi
+}
+
+# $1: title
+# $2: description
+# $3: default item
+# $@: items
+function menu_radiolist() {
+	local title="$1"
+	local description="$2"
+	local default_item="$3"
+	shift 3
+
+	# Build option array
+	local items=()
+	local item
+	for item in "$@"; do
+		if [[ $item == "$default_item" ]]; then
+			items+=("$item" "on")
+		else
+			items+=("$item" "off")
+		fi
+	done
+
+	# Show selection dialog
+	dialog \
+		--no-items \
+		--title "$title" \
+		--help-button \
+		--help-label "Select" \
+		--help-status \
+		--ok-label "OK" \
+		--default-item "$default_item" \
+		--default-button help \
+		--radiolist "$description\nUse <Select> to select the option under the cursor, or <OK> to use the option which is selected with an asterisk." \
+		"${RADIOLIST_SIZE[@]}" "${items[@]}"
+
+	local diag_exit="$?"
+	if [[ $diag_exit == 0 ]]; then
+		# <OK>
+		return 0
+	elif [[ $diag_exit == 1 ]]; then
+		# <Cancel>
+		return 1
+	elif [[ $diag_exit == 2 ]]; then
+		# <Select>
+		local sel="${dialog_out#HELP }"
+		local sel_cur="${sel% *}"
+		#local sel_radio="${sel#* }"
+		dialog_out="$sel_cur"
+		return 0
+	else
+		# <ESC><ESC>
+		return 1
+	fi
+}
+
+# $1: title
+# $2: description
+# $3: current device (will be canonicalized if possible)
+function menu_select_device() {
+	local title="$1"
+	local desc="$2"
+	local prev_selected
+	prev_selected=$(canonicalize_device "$3")
+
+	while true; do
+		local all_devices=()
+		local seen_devices=" "
+		local real name size type model
+		# Devices with a stable id (preferred), without CD/DVD drives and loop devices.
+		for dev in /dev/disk/by-id/*; do
+			[[ -e $dev ]] || continue
+			real="$(realpath "$dev")"
+			[[ $real == /dev/sr* || $real == /dev/loop* ]] && continue
+			seen_devices+="$real "
+			all_devices+=("$dev" "$(basename "$dev")")
+		done
+		# Devices without any stable id (e.g. virtio disks in GNOME Boxes / QEMU have no serial).
+		while read -r name size type model; do
+			[[ $type == "disk" || $type == "part" ]] || continue
+			[[ $seen_devices == *" $name "* || $name == /dev/zram* ]] && continue
+			all_devices+=("$name" "$(basename "$name")  ($size${model:+, $model})")
+		done < <(lsblk -pnl -e 7,11 -o NAME,SIZE,TYPE,MODEL 2>/dev/null)
+		all_devices+=("/dev/null" "<enter custom path>")
+
+		if menu_radiolist_labeled "$title" "$desc" "$prev_selected" "${all_devices[@]}"; then
+			if [[ "$dialog_out" == "/dev/null" ]]; then
+				while true; do
+					if dialog \
+						--title "$1" \
+						--inputbox "$([[ -e $prev_selected ]] || echo -n "\Z1The previously selected device $prev_selected does not exist!\Zn ")Enter the path of the desired device." \
+						"${INPUTBOX_SIZE[@]}" "$prev_selected"
+					then
+						# Repeat until selected device exists or cancelled
+						prev_selected="$dialog_out"
+						[[ ! -e "$dialog_out" ]] && continue
+						return 0
+					else
+						# <Cancel> -> return to previous menu
+						break
+					fi
+				done
+
+				# Return to radiolist
+				continue
+			else
+				return 0
+			fi
+		else
+			# <Cancel>
+			return 1
+		fi
+	done
+}
+
+function msgbox_help() {
+	dialog --msgbox "$1" "${HELP_POPUP_SIZE[@]}"
+}
+
+function menu_exit() {
+	if [[ $UNSAVED_CHANGES == "true" ]]; then
+		dialog \
+			--help-button --help-label "Back" \
+			--yes-label "Save" --no-label "Discard" \
+			--yesno "Do you want to save your configuration?\n(Press <ESC><ESC>, or choose <Back> to continue Exherbo configuration)." \
+			"${CONFIRM_SIZE[@]}"
+
+		local diag_exit="$?"
+		if [[ $diag_exit == 0 ]]; then
+			# <Save>
+			save "$CONFIG_FILE"
+			clear_and_exit 0
+		elif [[ $diag_exit == 1 ]]; then
+			# <Discard>
+			clear_and_exit 0
+		else
+			# Back to menu (<ESC><ESC>, <Back>)
+			true
+		fi
+	else
+		# Nothing was changed. Exit immediately.
+		clear_and_exit 0
+	fi
+}
+
+function menu_save_as() {
+	dialog \
+		--ok-label "Save" \
+		--inputbox "Enter a filename to which this configuration should be saved.\n(Press <ESC><ESC>, or choose <Cancel> to abort)." \
+		"${INPUTBOX_SIZE[@]}" "$SAVE_AS_FILENAME"
+
+	local diag_exit="$?"
+	if [[ $diag_exit == 0 ]]; then
+		# <Save>
+		SAVE_AS_FILENAME="$dialog_out"
+		save "$SAVE_AS_FILENAME"
+		UNSAVED_CHANGES=false
+	else
+		# Back to menu (<ESC><ESC>, <Cancel>)
+		true
+	fi
+}
+
+function menu() {
+	local item
+	local item_tag
+	local tag_item_list=()
+	declare -A reverse_lookup
+	update_backtitle
+
+	# Create menu list
+	for item in "${MENU_ITEMS[@]}"; do
+		# Only if item is visible
+		"${item}_show" || continue
+
+		item_tag="$("${item}_tag")"
+		tag_item_list+=("$item_tag" "$("${item}_label")")
+		reverse_lookup["$item_tag"]="$item"
+	done
+
+	dialog --colors \
+		--title " Exherbo configuration ($RELA_CONFIG_FILE) " \
+		--extra-button --extra-label "Exit" \
+		--help-button \
+		--default-item "$SELECTED_MENU_ITEM" \
+		--ok-label "Select" --cancel-label "Save" \
+		--menu "Work through the sections below, top to bottom (the defaults are sensible), then choose \">> Review and install\" at the end.\nPress <Help> on any line for details. Nothing is changed on your disks until you confirm the final plan." \
+		"${MENU_SIZE[@]}" "${tag_item_list[@]}"
+
+	local diag_exit="$?"
+	if [[ $diag_exit == 0 ]]; then
+		# <Select>
+		SELECTED_MENU_ITEM="$dialog_out"
+		[[ -z "$SELECTED_MENU_ITEM" ]] \
+			|| "${reverse_lookup[$SELECTED_MENU_ITEM]}_menu"
+	elif [[ $diag_exit == 1 ]]; then
+		# <Save>
+		SELECTED_MENU_ITEM="$dialog_out"
+		menu_save_as
+	elif [[ $diag_exit == 2 ]]; then
+		# <Help>
+		SELECTED_MENU_ITEM="${dialog_out#HELP }"
+		msgbox_help "$("${reverse_lookup[$SELECTED_MENU_ITEM]}_help")"
+	else
+		# Exit (<ESC><ESC>, <Exit>)
+		SELECTED_MENU_ITEM="${dialog_out:-$SELECTED_MENU_ITEM}"
+		menu_exit
+		true
+	fi
+}
+
+function init_menu_size() {
+	local cols
+	local rows
+	cols=$(tput cols)  || cols=80
+	rows=$(tput lines) || rows=24
+
+	local max_h=$((rows - 3))
+	local max_w=$((cols - 6))
+
+	SELECTED_MENU_ITEM=""
+	MENU_SIZE=("$max_h" "$max_w" "$((max_h - 8))")
+	INPUTBOX_SIZE=("11" "$max_w")
+	EDITTEXT_SIZE=("$max_h" "$max_w")
+	RADIOLIST_SIZE=("$max_h" "$max_w" "$((max_h - 12))")
+	BUILDLIST_SIZE=("$max_h" "$max_w" "$((max_h - 12))")
+	HELP_POPUP_SIZE=("$((max_h - 12))" "$((max_w - 10))")
+	CONFIRM_SIZE=("8" "66")
+}
+
+#SELECTED_MENU_ITEM=""
+#MENU_SIZE=("20" "76" "12")
+#INPUTBOX_SIZE=("11" "76")
+#EDITTEXT_SIZE=("16" "76")
+#RADIOLIST_SIZE=("20" "76" "8")
+#BUILDLIST_SIZE=("20" "76" "8")
+#HELP_POPUP_SIZE=("8" "66")
+#CONFIRM_SIZE=("8" "66")
+init_menu_size
+
+
+################################################
+# Partition planning helpers (sizes, preview, validation)
+
+# $1: size like 8GiB, 512MiB, 1G, 1.5TiB -> integer MiB
+function size_to_mib() {
+	local s="$1" num unit
+	[[ $s =~ ^([0-9]+(\.[0-9]+)?)(K|M|G|T|KiB|MiB|GiB|TiB)$ ]] || return 1
+	num="${BASH_REMATCH[1]}"
+	unit="${BASH_REMATCH[3]}"
+	case "$unit" in
+		K|KiB) awk -v n="$num" 'BEGIN { printf "%d", n / 1024 }' ;;
+		M|MiB) awk -v n="$num" 'BEGIN { printf "%d", n }' ;;
+		G|GiB) awk -v n="$num" 'BEGIN { printf "%d", n * 1024 }' ;;
+		T|TiB) awk -v n="$num" 'BEGIN { printf "%d", n * 1024 * 1024 }' ;;
+	esac
+}
+
+# $1: MiB -> "1.5 GiB"
+function format_mib() {
+	awk -v m="$1" 'BEGIN {
+		if (m >= 1048576) printf "%.1f TiB", m / 1048576;
+		else if (m >= 1024) printf "%.1f GiB", m / 1024;
+		else printf "%d MiB", m }'
+}
+
+# $1: device -> size in MiB (fails if the device does not exist)
+function disk_size_mib() {
+	local bytes
+	[[ -b $1 ]] || return 1
+	bytes="$(lsblk -bdno SIZE "$1" 2>/dev/null | head -n 1 | tr -d '[:space:]')"
+	[[ $bytes =~ ^[0-9]+$ ]] || return 1
+	echo -n "$((bytes / 1048576))"
+}
+
+# Swap size in MiB for a PARTITIONING_SWAP value (auto: depends on the RAM of this machine,
+# the same rule as the installer uses)
+function plan_swap_mib() {
+	local kb gib
+	if [[ $1 == "auto" ]]; then
+		kb="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null)"
+		gib=$(( (${kb:-0} + 1048575) / 1048576 ))
+		[[ $gib -lt 1 ]] && gib=1
+		if [[ $gib -le 2 ]]; then
+			echo -n "$(( (gib * 2 > 2 ? gib * 2 : 2) * 1024 ))"
+		elif [[ $gib -le 8 ]]; then
+			echo -n "$((gib * 1024))"
+		else
+			echo -n 8192
+		fi
+	else
+		size_to_mib "$1"
+	fi
+}
+
+# Default partition list for the custom partitioning editor: swap + root (btrfs) taking the rest.
+# $1: device (only used to look at its size)
+function manual_default_parts() {
+	echo -n "$(format_mib "$(plan_swap_mib auto)" | sed -e 's/\.0 / /' -e 's/ //'):swap:swap;remaining:/:ext4"
+}
+
+# Fills PLAN_PROBLEMS with everything that is wrong with the manual partition list.
+function manual_validate() {
+	PLAN_PROBLEMS=()
+	local size_re='^([0-9]+(\.[0-9]+)?(K|M|G|T|KiB|MiB|GiB|TiB)|remaining)$'
+	local mp_re='^/[A-Za-z0-9._/-]*$'
+	local row size mount fs luks have_root=false have_swap=false saw_remaining=false
+	local -A seen=()
+	for row in "${PARTITIONING_MANUAL_PARTS[@]}"; do
+		size="" mount="" fs="" luks=""
+		IFS=':' read -r size mount fs luks <<< "$row"
+		[[ $saw_remaining == false ]] || PLAN_PROBLEMS+=("'$mount' comes after the 'remaining' partition; only the last partition can take the rest.")
+		[[ $size =~ $size_re ]] || PLAN_PROBLEMS+=("'$size' is not a valid size (use e.g. 512MiB, 8GiB or remaining).")
+		[[ $size == remaining ]] && saw_remaining=true
+		case "$fs" in ext4|btrfs|swap) ;; *) PLAN_PROBLEMS+=("Unsupported filesystem '$fs' for '$mount'.") ;; esac
+		if [[ $mount == swap ]]; then
+			[[ $have_swap == false ]] || PLAN_PROBLEMS+=("Only one swap partition is supported.")
+			have_swap=true
+		else
+			[[ $mount =~ $mp_re ]] || PLAN_PROBLEMS+=("'$mount' is not a valid mountpoint.")
+			[[ $mount != /boot && $mount != /boot/* ]] || PLAN_PROBLEMS+=("'$mount' is the boot partition, which the installer manages itself.")
+			[[ ! -v seen[$mount] ]] || PLAN_PROBLEMS+=("Mountpoint '$mount' is used twice.")
+			seen[$mount]=true
+			[[ $mount == "/" ]] && have_root=true
+			[[ -z $luks || $mount == "/" ]] || PLAN_PROBLEMS+=("Only the root partition can be encrypted ('$mount').")
+		fi
+	done
+	[[ $have_root == true ]] || PLAN_PROBLEMS+=("There is no root ('/') partition.")
+
+	local disk_mib total=0
+	if disk_mib="$(disk_size_mib "$PARTITIONING_DEVICE")"; then
+		total="$(size_to_mib "$PARTITIONING_MANUAL_BOOT_SIZE" || echo 0)"
+		for row in "${PARTITIONING_MANUAL_PARTS[@]}"; do
+			IFS=':' read -r size _ <<< "$row"
+			[[ $size == remaining ]] && continue
+			total=$((total + $(size_to_mib "$size" || echo 0)))
+		done
+		[[ $total -lt $disk_mib ]] || PLAN_PROBLEMS+=("The partitions (${total} MiB) do not fit on the disk ($(format_mib "$disk_mib")).")
+	fi
+}
+
+# Prints a table describing what the selected scheme will do to the disk.
+function partition_plan_text() {
+	PLAN_PROBLEMS=()
+	local dev="${PARTITIONING_DEVICE:-}"
+	local disk_mib="" disk_desc="(no disk selected)"
+	if [[ -n $dev ]] && disk_mib="$(disk_size_mib "$dev")"; then
+		disk_desc="$(shorten_device "$dev")  ·  $(format_mib "$disk_mib")"
+	elif [[ -n $dev ]]; then
+		disk_desc="$(shorten_device "$dev")  ·  size unknown (device not found)"
+		disk_mib=""
+	fi
+
+	local boot_label="EFI system partition" boot_fs="FAT32" boot_mount="/boot"
+	if [[ $PARTITIONING_BOOT_TYPE == "bios" ]]; then
+		boot_label="BIOS boot (syslinux)"
+		boot_mount="/boot/bios"
+	fi
+
+	local rows=() # role|size_mib|fs|mount|note
+	local details=()
+	local used=0 mib
+	case "$PARTITIONING_SCHEME" in
+		classic_single_disk|manual)
+			if [[ $PARTITIONING_SCHEME == "manual" ]]; then
+				mib="$(size_to_mib "$PARTITIONING_MANUAL_BOOT_SIZE" || echo 1024)"
+			else
+				mib=1024
+			fi
+			rows+=("$boot_label|$mib|$boot_fs|$boot_mount|")
+			used=$mib
+			if [[ $PARTITIONING_SCHEME == "classic_single_disk" ]]; then
+				if is_on "$PARTITIONING_USE_SWAP"; then
+					mib="$(plan_swap_mib "$PARTITIONING_SWAP" || echo 0)"
+					rows+=("Swap|$mib|swap|—|")
+					used=$((used + mib))
+				fi
+				local note=""
+				is_on "$PARTITIONING_USE_LUKS" && { note="LUKS"; details+=("Root is encrypted with LUKS (you enter the passphrase at boot)."); }
+				if [[ $PARTITIONING_ROOT_FS == "btrfs" ]] && is_on "$PARTITIONING_BTRFS_SUBVOLUMES"; then
+					details+=("Btrfs subvolumes: / (root), /home, /.snapshots, /var/log, /var/cache.")
+				fi
+				rows+=("Root|rest|$PARTITIONING_ROOT_FS|/|$note")
+			else
+				local row size mount fs luks label
+				for row in "${PARTITIONING_MANUAL_PARTS[@]}"; do
+					size="" mount="" fs="" luks=""
+					IFS=':' read -r size mount fs luks <<< "$row"
+					if [[ $mount == swap ]]; then label="Swap"; elif [[ $mount == / ]]; then label="Root"; else label="Data"; fi
+					mib="rest"
+					if [[ $size != remaining ]]; then
+						mib="$(size_to_mib "$size" || echo 0)"
+						used=$((used + mib))
+					fi
+					rows+=("$label|$mib|$fs|$([[ $mount == swap ]] && echo "—" || echo "$mount")|${luks:+LUKS}")
+					[[ -z $luks ]] || details+=("Root is encrypted with LUKS (you enter the passphrase at boot).")
+				done
+				manual_validate
+			fi
+			;;
+	esac
+
+	local total_note=""
+	if [[ $PARTITIONING_SCHEME == "classic_single_disk" || $PARTITIONING_SCHEME == "manual" ]]; then
+		if [[ -z $dev || ! -e $dev ]]; then
+			PLAN_PROBLEMS+=("The target disk '${dev:-none}' does not exist. Choose it with 'Device'.")
+		elif [[ -n $disk_mib ]]; then
+			local rest=$((disk_mib - used - 2))
+			if [[ $rest -lt 1024 && $PARTITIONING_SCHEME == "classic_single_disk" ]]; then
+				PLAN_PROBLEMS+=("Not enough space: only $(format_mib "$rest") would remain for the root filesystem. A desktop needs 30 GiB or more.")
+			elif [[ $rest -lt 8192 && $PARTITIONING_SCHEME == "classic_single_disk" ]]; then
+				PLAN_PROBLEMS+=("Only $(format_mib "$rest") remain for the root filesystem; a desktop install needs about 30 GiB.")
+			fi
+			local r i
+			for i in "${!rows[@]}"; do
+				IFS='|' read -r label mib _ <<< "${rows[$i]}"
+				if [[ $mib == rest ]]; then
+					rows[i]="${rows[$i]/|rest|/|$rest|}"
+				fi
+			done
+		fi
+	fi
+
+	if [[ ${#rows[@]} -gt 0 ]]; then
+		printf '  Disk   %s  ·  GPT  ·  %s\n\n' "$disk_desc" "$([[ $PARTITIONING_BOOT_TYPE == efi ]] && echo "EFI boot" || echo "BIOS boot")"
+		printf '  %-3s %-22s %-10s %-6s %-14s %s\n' "#" "Partition" "Size" "FS" "Mount" "Notes"
+		printf '  %s\n' "──────────────────────────────────────────────────────────────────────────────"
+		local n=0 label mib2 fs mount note shown
+		for r in "${rows[@]}"; do
+			n=$((n + 1))
+			IFS='|' read -r label mib2 fs mount note <<< "$r"
+			if [[ $mib2 == rest ]]; then shown="rest"; else shown="$(format_mib "$mib2")"; fi
+			printf '  %-3s %-22s %-10s %-6s %-14s %s\n' "$n" "$label" "$shown" "$fs" "$mount" "$note"
+		done
+		local d
+		for d in "${details[@]}"; do printf '\n  • %s' "$d"; done
+		printf '\n\n  The whole disk is erased and repartitioned (GPT).\n  Nothing happens until you confirm the plan.\n'
+	else
+		case "$PARTITIONING_SCHEME" in
+			existing_partitions)
+				printf '  Existing partitions are used as they are (nothing is repartitioned or formatted).\n\n  Root: %s\n  Boot: %s\n  Swap: %s\n' \
+					"$PARTITIONING_DEVICE" "$PARTITIONING_BOOT_DEVICE" "$([[ $PARTITIONING_USE_SWAP == true ]] && echo "${PARTITIONING_SWAP_DEVICE:-none}" || echo none)" ;;
+			zfs_centric)
+				printf '  ZFS: %s device(s), pool type %s, encryption %s, compression %s.\n  Layout: boot (1 GiB)%s on the first disk, the rest goes to the pool.\n' \
+					"${#PARTITIONING_DEVICES[@]}" "$PARTITIONING_ZFS_POOL_TYPE" "$PARTITIONING_ZFS_USE_ENCRYPTION" "$([[ $PARTITIONING_ZFS_USE_COMPRESSION == true ]] && echo "$PARTITIONING_ZFS_COMPRESSION" || echo off)" \
+					"$([[ $PARTITIONING_USE_SWAP == true ]] && echo ", swap ($PARTITIONING_SWAP)")" ;;
+			btrfs_centric)
+				printf '  Btrfs across %s device(s), raid type %s%s.\n  Layout: boot (1 GiB)%s on the first disk, the rest forms the btrfs array.\n' \
+					"${#PARTITIONING_DEVICES[@]}" "$PARTITIONING_BTRFS_RAID_TYPE" "$([[ $PARTITIONING_USE_LUKS == true ]] && echo ", LUKS encrypted")" \
+					"$([[ $PARTITIONING_USE_SWAP == true ]] && echo ", swap ($PARTITIONING_SWAP)")" ;;
+			raid0_luks)
+				printf '  Raid0 across %s device(s) with LUKS, root filesystem %s.\n  Layout: boot (1 GiB) on the first disk, swap raid0%s, root raid0 + LUKS.\n' \
+					"${#PARTITIONING_DEVICES[@]}" "$PARTITIONING_ROOT_FS" "$([[ $PARTITIONING_USE_SWAP == true ]] && echo " ($PARTITIONING_SWAP each)")" ;;
+			custom)
+				printf '  The disk layout is defined by the disk_configuration function in your config file.\n' ;;
+		esac
+	fi
+
+	if [[ ${#PLAN_PROBLEMS[@]} -gt 0 ]]; then
+		printf '\n  !! Problems:\n'
+		local pr
+		for pr in "${PLAN_PROBLEMS[@]}"; do printf '     - %s\n' "$pr"; done
+	fi
+}
+
+function show_partition_plan() {
+	local text
+	text="$(partition_plan_text)"
+	dialog --title " Disk layout preview " --no-collapse --ok-label "Close" \
+		--msgbox "$text" "$((MENU_SIZE[0] > 22 ? 22 : MENU_SIZE[0]))" "${MENU_SIZE[1]}"
+}
+
+
+################################################
+# Custom partitioning editor
+
+MANUAL_MOUNT_CHOICES=("/" "swap" "/home" "/var" "/opt" "/srv" "/data" "<custom>")
+
+function manual_row_get() { # idx field(1-4)
+	local row="${PARTITIONING_MANUAL_PARTS[$1]}"
+	local f1 f2 f3 f4
+	IFS=':' read -r f1 f2 f3 f4 <<< "$row"
+	case "$2" in 1) echo -n "$f1" ;; 2) echo -n "$f2" ;; 3) echo -n "$f3" ;; 4) echo -n "$f4" ;; esac
+}
+
+function manual_row_set() { # idx size mount fs luks
+	PARTITIONING_MANUAL_PARTS[$1]="$2:$3:$4:$5"
+	PARTITIONING_MANUAL_PARTS[$1]="${PARTITIONING_MANUAL_PARTS[$1]%:}"
+	UNSAVED_CHANGES=true
+}
+
+# $1: current mountpoint. Sets dialog_out. Returns 1 on cancel.
+function manual_pick_mount() {
+	local items=() m
+	for m in "${MANUAL_MOUNT_CHOICES[@]}"; do
+		case "$m" in
+			"/")        items+=("/" "/  (root, required)") ;;
+			"swap")     items+=("swap" "swap space") ;;
+			"/home")    items+=("/home" "/home  (user files)") ;;
+			"/var")     items+=("/var" "/var  (logs, caches, databases)") ;;
+			"/opt")     items+=("/opt" "/opt") ;;
+			"/srv")     items+=("/srv" "/srv  (served data)") ;;
+			"/data")    items+=("/data" "/data  (extra storage)") ;;
+			"<custom>") items+=("<custom>" "Other mountpoint…") ;;
+		esac
+	done
+	menu_radiolist_labeled "Mountpoint" "Where should this partition be mounted?" "$1" "${items[@]}" || return 1
+	if [[ $dialog_out == "<custom>" ]]; then
+		dialog --title "Mountpoint" --inputbox "Enter an absolute mountpoint (e.g. /mnt/games). /boot is managed by the installer." \
+			"${INPUTBOX_SIZE[@]}" "/" || return 1
+		[[ $dialog_out =~ ^/[A-Za-z0-9._/-]*$ ]] || { dialog --msgbox "'$dialog_out' is not a valid mountpoint." 7 50; return 1; }
+	fi
+	return 0
+}
+
+function manual_pick_size() { # current default
+	while true; do
+		dialog --title "Partition size" \
+			--inputbox "Size of the partition, e.g. 512MiB, 8GiB, 1.5TiB. Enter 'remaining' to use all remaining space (only possible for the last partition)." \
+			"${INPUTBOX_SIZE[@]}" "$1" || return 1
+		if [[ $dialog_out == remaining ]] || size_to_mib "$dialog_out" >/dev/null; then
+			return 0
+		fi
+		dialog --msgbox "'$dialog_out' is not a valid size. Use a number with a unit, like 8GiB or 512MiB." 7 60
+		set -- "$dialog_out"
+	done
+}
+
+function manual_pick_fs() { # current
+	menu_radiolist_labeled "Filesystem" "Select the filesystem for this partition." "$1" \
+		"ext4"  "ext4  (robust, simple)" \
+		"btrfs" "btrfs (compression, snapshots)"
+}
+
+function manual_add_partition() {
+	manual_pick_mount "/home" || return 0
+	local mount="$dialog_out" size fs
+	if [[ $mount == swap ]]; then
+		fs=swap
+		size="$(format_mib "$(plan_swap_mib auto)" | sed -e 's/\.0 / /' -e 's/ //')"
+	else
+		manual_pick_fs ext4 || return 0
+		fs="$dialog_out"
+		size=remaining
+	fi
+	manual_pick_size "$size" || return 0
+	size="$dialog_out"
+	local i
+	PARTITIONING_MANUAL_PARTS+=("$size:$mount:$fs")
+	# Keep a 'remaining' partition at the end
+	for i in "${!PARTITIONING_MANUAL_PARTS[@]}"; do
+		if [[ ${PARTITIONING_MANUAL_PARTS[$i]} == remaining:* && $i -ne $((${#PARTITIONING_MANUAL_PARTS[@]} - 1)) ]]; then
+			local moved="${PARTITIONING_MANUAL_PARTS[$i]}"
+			unset "PARTITIONING_MANUAL_PARTS[$i]"
+			PARTITIONING_MANUAL_PARTS=("${PARTITIONING_MANUAL_PARTS[@]}" "$moved")
+			break
+		fi
+	done
+	UNSAVED_CHANGES=true
+}
+
+function manual_edit_row() { # idx
+	local idx="$1" choice
+	while true; do
+		[[ -v PARTITIONING_MANUAL_PARTS[$idx] ]] || return 0
+		local size mount fs luks
+		size="$(manual_row_get "$idx" 1)"; mount="$(manual_row_get "$idx" 2)"
+		fs="$(manual_row_get "$idx" 3)"; luks="$(manual_row_get "$idx" 4)"
+		local items=(
+			"size"   "Size            ($size)"
+			"mount"  "Mountpoint      ($mount)"
+		)
+		[[ $mount == swap ]] || items+=("fs" "Filesystem      ($fs)")
+		[[ $mount == "/" ]] && items+=("luks" "Encryption      ($([[ $luks == luks ]] && echo "LUKS on" || echo off))")
+		items+=("up" "Move up" "down" "Move down" "delete" "Delete this partition" "back" "« Back")
+		dialog --title " Partition: $mount " --no-tags --cancel-label "Back" --menu "Edit this partition." \
+			"$((${#items[@]} / 2 + 7))" 52 "$((${#items[@]} / 2))" "${items[@]}" || return 0
+		choice="$dialog_out"
+		case "$choice" in
+			size)   manual_pick_size "$size" && manual_row_set "$idx" "$dialog_out" "$mount" "$fs" "$luks" ;;
+			mount)
+				if manual_pick_mount "$mount"; then
+					local nm="$dialog_out" nfs="$fs" nluks="$luks"
+					if [[ $nm == swap ]]; then nfs=swap; nluks=""; elif [[ $fs == swap ]]; then nfs=ext4; fi
+					[[ $nm == "/" ]] || nluks=""
+					manual_row_set "$idx" "$size" "$nm" "$nfs" "$nluks"
+				fi ;;
+			fs)     manual_pick_fs "$fs" && manual_row_set "$idx" "$size" "$mount" "$dialog_out" "$luks" ;;
+			luks)   manual_row_set "$idx" "$size" "$mount" "$fs" "$([[ $luks == luks ]] && echo "" || echo luks)" ;;
+			up)
+				if [[ $idx -gt 0 ]]; then
+					local tmp="${PARTITIONING_MANUAL_PARTS[$((idx - 1))]}"
+					PARTITIONING_MANUAL_PARTS[$((idx - 1))]="${PARTITIONING_MANUAL_PARTS[$idx]}"
+					PARTITIONING_MANUAL_PARTS[$idx]="$tmp"
+					UNSAVED_CHANGES=true
+					idx=$((idx - 1))
+				fi ;;
+			down)
+				if [[ $idx -lt $((${#PARTITIONING_MANUAL_PARTS[@]} - 1)) ]]; then
+					local tmp2="${PARTITIONING_MANUAL_PARTS[$((idx + 1))]}"
+					PARTITIONING_MANUAL_PARTS[$((idx + 1))]="${PARTITIONING_MANUAL_PARTS[$idx]}"
+					PARTITIONING_MANUAL_PARTS[$idx]="$tmp2"
+					UNSAVED_CHANGES=true
+					idx=$((idx + 1))
+				fi ;;
+			delete)
+				if dialog --defaultno --yesno "Delete the partition '$mount'?" 7 50; then
+					unset "PARTITIONING_MANUAL_PARTS[$idx]"
+					PARTITIONING_MANUAL_PARTS=("${PARTITIONING_MANUAL_PARTS[@]}")
+					UNSAVED_CHANGES=true
+					return 0
+				fi ;;
+			back) return 0 ;;
+		esac
+	done
+}
+
+function manual_apply_preset() {
+	menu_radiolist_labeled "Presets" "Replace the partition list with a ready-made layout." "swap_root" \
+		"swap_root"  "Swap + root (everything else on /)" \
+		"swap_home"  "Swap + root + separate /home (survives reinstalls)" \
+		"root_only"  "Root only (no swap)" || return 0
+	local swap root_size disk_mib
+	swap="$(format_mib "$(plan_swap_mib auto)" | sed -e 's/\.0 / /' -e 's/ //')"
+	root_size="40GiB"
+	if disk_mib="$(disk_size_mib "$PARTITIONING_DEVICE")"; then
+		# a third of the disk for / (between 30 and 100 GiB)
+		local gib=$((disk_mib / 1024 / 3))
+		[[ $gib -lt 30 ]] && gib=30
+		[[ $gib -gt 100 ]] && gib=100
+		root_size="${gib}GiB"
+	fi
+	case "$dialog_out" in
+		swap_root) PARTITIONING_MANUAL_PARTS=("$swap:swap:swap" "remaining:/:ext4") ;;
+		swap_home) PARTITIONING_MANUAL_PARTS=("$swap:swap:swap" "$root_size:/:ext4" "remaining:/home:ext4") ;;
+		root_only) PARTITIONING_MANUAL_PARTS=("remaining:/:ext4") ;;
+	esac
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_MANUAL_menu_editor() {
+	local choice
+	while true; do
+		local items=() i size mount fs luks
+		local boot_text
+		boot_text="$(printf '%-24s %-10s %-6s %s' "$([[ $PARTITIONING_BOOT_TYPE == efi ]] && echo "EFI system partition" || echo "BIOS boot partition")" "$PARTITIONING_MANUAL_BOOT_SIZE" "FAT32" "$([[ $PARTITIONING_BOOT_TYPE == efi ]] && echo /boot || echo /boot/bios)")"
+		items+=("boot" "1  $boot_text")
+		for i in "${!PARTITIONING_MANUAL_PARTS[@]}"; do
+			size="$(manual_row_get "$i" 1)"; mount="$(manual_row_get "$i" 2)"
+			fs="$(manual_row_get "$i" 3)"; luks="$(manual_row_get "$i" 4)"
+			items+=("$i" "$((i + 2))  $(printf '%-24s %-10s %-6s %s' "$([[ $mount == swap ]] && echo "Swap" || echo "$mount")" "$size" "$fs" "${luks:+(LUKS)}")")
+		done
+		items+=("add" "+  Add a partition" "preset" "↺  Start from a preset layout" "done" "✔  Done")
+
+		manual_validate
+		local disk_line free_line="" disk_mib=""
+		if disk_mib="$(disk_size_mib "$PARTITIONING_DEVICE")"; then
+			disk_line="Disk: $(shorten_device "$PARTITIONING_DEVICE")  ($(format_mib "$disk_mib"))"
+		else
+			disk_line="Disk: \\Z1$(shorten_device "$PARTITIONING_DEVICE") (not found - choose the disk in the main menu first)\\Zn"
+		fi
+		local problems=""
+		[[ -n $disk_mib ]] || PLAN_PROBLEMS+=("No disk selected yet.")
+		if [[ ${#PLAN_PROBLEMS[@]} -gt 0 ]]; then
+			problems="\\n\\Z1$(printf '! %s\\n' "${PLAN_PROBLEMS[@]}")\\Zn"
+		else
+			problems="\\n\\Z2Layout is valid.\\Zn"
+		fi
+		dialog --title " Custom partitioning " --no-tags --cancel-label "Done" --ok-label "Edit" \
+			--default-item "${choice:-boot}" \
+			--menu "$disk_line\\nThe whole disk is erased. Select a partition to edit it; the last one may use 'remaining'.\\n$problems" \
+			"$(( (${#items[@]} / 2 + 11) > MENU_SIZE[0] ? MENU_SIZE[0] : (${#items[@]} / 2 + 11) ))" "${MENU_SIZE[1]}" "$((${#items[@]} / 2))" "${items[@]}" || return 0
+		choice="$dialog_out"
+		case "$choice" in
+			boot)
+				if manual_pick_size "$PARTITIONING_MANUAL_BOOT_SIZE" && [[ $dialog_out != remaining ]]; then
+					PARTITIONING_MANUAL_BOOT_SIZE="$dialog_out"
+					UNSAVED_CHANGES=true
+				fi ;;
+			add)    manual_add_partition ;;
+			preset) manual_apply_preset ;;
+			done)   return 0 ;;
+			*)      manual_edit_row "$choice" ;;
+		esac
+	done
+}
+
+################################################
+# Review screen and dynamic title
+
+function review_text() {
+	echo "DISK"
+	partition_plan_text
+	echo
+	echo "BOOT        $([[ $PARTITIONING_BOOT_TYPE == bios ]] && echo "syslinux (BIOS)" || echo "$BOOTLOADER (EFI)")"
+	echo
+	echo "SYSTEM      host '$HOSTNAME', timezone $TIMEZONE, keymap $KEYMAP, locale $LOCALE"
+	echo "ACCOUNTS    root: $ROOT_PASSWORD_MODE; user: ${USER_NAME:-none}$([[ -n $USER_NAME && $USER_SUDO == true ]] && echo " (sudo)")"
+	if [[ $DESKTOP == none ]]; then
+		echo "DESKTOP     none (console only)"
+	else
+		echo "DESKTOP     $(desktop_name), login screen: $(display_manager_name)"
+	fi
+	echo "NETWORK     $NETWORK_BACKEND"
+	echo "EXHERBO     everything is compiled from source with cave (no binary packages); expect hours"
+}
+
+function update_backtitle() {
+	local disk="no disk"
+	case "$PARTITIONING_SCHEME" in
+		classic_single_disk|manual|existing_partitions)
+			[[ -e ${PARTITIONING_DEVICE:-} ]] && disk="$(basename "$(shorten_device "$PARTITIONING_DEVICE")")" ;;
+		zfs_centric|btrfs_centric|raid0_luks) disk="${#PARTITIONING_DEVICES[@]} disks" ;;
+		custom) disk="custom layout" ;;
+	esac
+	local boot
+	if [[ ${PARTITIONING_BOOT_TYPE:-efi} == bios ]]; then boot="BIOS/GRUB"; else boot="EFI/$BOOTLOADER"; fi
+	BACKTITLE="Exherbo Forge  ▸  $disk  ▸  $boot  ▸  $([[ $DESKTOP == none ]] && echo "console" || desktop_name)  ▸  $NETWORK_BACKEND$([[ $UNSAVED_CHANGES == true ]] && echo "  ●unsaved")"
+}
+
+# Section header rows in the main menu (reverse video bars)
+function section_tag()   { printf '━━ %s ━━' "$1"; }
+function section_label() { local rule; rule="$(printf '━%.0s' {1..120})"; printf '\\Z5%s\\Zn' "$rule"; }
+
+################################################
+# Menu definition
+
+MENU_ITEMS=(
+	"SECTION_DISK"
+	"PARTITIONING_SCHEME"
+	"PARTITIONING_BOOT_TYPE"
+	"PARTITIONING_BOOT_DEVICE"
+	"PARTITIONING_USE_SWAP"
+	"PARTITIONING_SWAP"
+	"PARTITIONING_SWAP_DEVICE"
+	"PARTITIONING_ROOT_FS"
+	"PARTITIONING_BTRFS_SUBVOLUMES"
+	"PARTITIONING_USE_LUKS"
+	"PARTITIONING_ZFS_POOL_TYPE"
+	"PARTITIONING_ZFS_USE_ENCRYPTION"
+	"PARTITIONING_ZFS_USE_COMPRESSION"
+	"PARTITIONING_ZFS_COMPRESSION"
+	"PARTITIONING_BTRFS_RAID_TYPE"
+	"PARTITIONING_DEVICE"
+	"PARTITIONING_DEVICES"
+	"PARTITIONING_MANUAL"
+	"PARTITIONING_PLAN"
+	"BOOTLOADER"
+	"SECTION_SYSTEM"
+	"HOSTNAME"
+	"TIMEZONE"
+	"KEYMAP"
+	"KEYMAP_INITRAMFS_OTHER"
+	"KEYMAP_INITRAMFS"
+	"LOCALES"
+	"LOCALE"
+	"SECTION_ACCOUNTS"
+	"ROOT_PASSWORD_MODE"
+	"ROOT_PASSWORD"
+	"USER_NAME"
+	"USER_PASSWORD"
+	"USER_SUDO"
+	"SECTION_DESKTOP"
+	"DESKTOP"
+	"DISPLAY_MANAGER"
+	"SECTION_NETWORK"
+	"NETWORK_BACKEND"
+	"COPY_LIVE_WIFI"
+	"SYSTEMD_NETWORKD_INTERFACE_NAME"
+	"SYSTEMD_NETWORKD_DHCP"
+	"SYSTEMD_NETWORKD_ADDRESSES"
+	"SYSTEMD_NETWORKD_GATEWAY"
+	"SECTION_EXHERBO"
+	"KERNEL_CONFIG"
+	"ADDITIONAL_PACKAGES"
+	"SECTION_FINISH"
+	"INSTALL_NOW"
+)
+
+function --------_tag()   { echo "────────────────────────────"; }
+function --------_label() { echo "────────────────────────────"; }
+function --------_show()  { return 0; }
+function --------_help()  { echo "Congratulations, you found a separator."; }
+function --------_menu()  { true; }
+
+function SECTION_DISK_tag()      { section_tag "DISK & BOOT"; }
+function SECTION_DISK_label()    { section_label; }
+function SECTION_DISK_show()     { return 0; }
+function SECTION_DISK_help()     { echo "Where and how Exherbo is installed: partitioning, swap and the bootloader."; }
+function SECTION_DISK_menu()     { true; }
+function SECTION_SYSTEM_tag()    { section_tag "SYSTEM"; }
+function SECTION_SYSTEM_label()  { section_label; }
+function SECTION_SYSTEM_show()   { return 0; }
+function SECTION_SYSTEM_help()   { echo "Hostname, time zone, keyboard layout and language."; }
+function SECTION_SYSTEM_menu()   { true; }
+function SECTION_ACCOUNTS_tag()  { section_tag "ACCOUNTS"; }
+function SECTION_ACCOUNTS_label(){ section_label; }
+function SECTION_ACCOUNTS_show() { return 0; }
+function SECTION_ACCOUNTS_help() { echo "The root account and your regular user."; }
+function SECTION_ACCOUNTS_menu() { true; }
+function SECTION_DESKTOP_tag()   { section_tag "DESKTOP"; }
+function SECTION_DESKTOP_label() { section_label; }
+function SECTION_DESKTOP_show()  { return 0; }
+function SECTION_DESKTOP_help()  { echo "Graphical desktop and login screen."; }
+function SECTION_DESKTOP_menu()  { true; }
+function SECTION_NETWORK_tag()   { section_tag "NETWORK"; }
+function SECTION_NETWORK_label() { section_label; }
+function SECTION_NETWORK_show()  { return 0; }
+function SECTION_NETWORK_help()  { echo "How the installed system connects to the network."; }
+function SECTION_NETWORK_menu()  { true; }
+function SECTION_EXHERBO_tag()    { section_tag "EXHERBO"; }
+function SECTION_EXHERBO_label()  { section_label; }
+function SECTION_EXHERBO_show()   { return 0; }
+function SECTION_EXHERBO_help()   { echo "Extra packages (installed with cave) and Exherbo specific settings."; }
+function SECTION_EXHERBO_menu()   { true; }
+function SECTION_FINISH_tag()    { section_tag "FINISH"; }
+function SECTION_FINISH_label()  { section_label; }
+function SECTION_FINISH_show()   { return 0; }
+function SECTION_FINISH_help()   { echo "Review everything and start the installation."; }
+function SECTION_FINISH_menu()   { true; }
+
+function PARTITIONING_SCHEME_tag()   { echo "Partitioning scheme"; }
+function PARTITIONING_SCHEME_label() {
+	case "$PARTITIONING_SCHEME" in
+		classic_single_disk) echo "(recommended: auto-sized single disk)" ;;
+		manual)              echo "(custom partitioning)" ;;
+		existing_partitions) echo "(existing partitions)" ;;
+		zfs_centric)         echo "(ZFS)" ;;
+		btrfs_centric)       echo "(btrfs multi-disk)" ;;
+		raid0_luks)          echo "(raid0 + LUKS)" ;;
+		custom)              echo "(expert: hand-written)" ;;
+		*)                   echo "($PARTITIONING_SCHEME)" ;;
+	esac
+}
+function PARTITIONING_SCHEME_show()  { return 0; }
+function PARTITIONING_SCHEME_help()  { echo "Select the desired partitioning scheme."; }
+function PARTITIONING_SCHEME_menu()  {
+	if menu_radiolist_labeled \
+		"Select partitioning scheme" \
+		"Select which partitioning scheme you want to follow. Have a look at the help text for this option (available in the menu) for more details.\n\nAll options support EFI/BIOS and swap. (Disk encryption, RAID and ZFS are not supported by the Exherbo installer yet.)\n" \
+		"$PARTITIONING_SCHEME" \
+		"${ALL_PARTITIONING_SCHEMES[@]}"
+	then
+		# Set disk scheme (the already selected disk is kept)
+		local prev_disk="${PARTITIONING_DEVICE:-}"
+		[[ -n $prev_disk ]] || prev_disk="${PARTITIONING_DEVICES[0]:-/dev/sdX}"
+		local prev_type="${PARTITIONING_BOOT_TYPE:-$DEFAULT_BOOT_TYPE}"
+		case "$dialog_out" in
+			"classic_single_disk") create_classic_single_disk_layout swap=auto type="$prev_type" luks=false root_fs=btrfs subvolumes=true "$prev_disk" ;;
+			"manual")              create_manual_layout type="$prev_type" parts="$(manual_default_parts "$prev_disk")" "$prev_disk" ;;
+			"existing_partitions") create_existing_partitions_layout boot=/dev/sdA swap=false type="$prev_type" "$prev_disk" ;;
+			"zfs_centric")         create_zfs_centric_layout swap=auto type="$prev_type" encrypt=true compress=zstd pool_type=standard "$prev_disk" ;;
+			"btrfs_centric")       create_btrfs_centric_layout swap=auto type="$prev_type" raid_type=raid0 luks=false "$prev_disk" ;;
+			"raid0_luks")          create_raid0_luks_layout swap=auto type="$prev_type" root_fs=ext4 "$prev_disk" /dev/sdY ;;
+			"custom")              PARTITIONING_SCHEME="$dialog_out" ;;
+		esac
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_BOOT_TYPE_tag()   { echo " ├ Boot type"; }
+function PARTITIONING_BOOT_TYPE_label() { echo " ├ ($PARTITIONING_BOOT_TYPE)$([[ $PARTITIONING_BOOT_TYPE == efi && $HAS_EFI_SUPPORT == false ]] && echo -n " \Z1$EFI_UNSUPPORTED_MESSAGE_SHORT\Zn" || echo -n "")"; }
+function PARTITIONING_BOOT_TYPE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]]; }
+function PARTITIONING_BOOT_TYPE_help()  { echo "Select whether to use EFI or BIOS boot."; }
+function PARTITIONING_BOOT_TYPE_menu()  {
+	if menu_radiolist_labeled \
+		"Select boot type" \
+		"Select whether your want to use EFI or BIOS boot.$(on_off_str "$HAS_EFI_SUPPORT" "" " \Z1$EFI_UNSUPPORTED_MESSAGE\Zn")" \
+		"$PARTITIONING_BOOT_TYPE" \
+		"${PARTITIONING_BOOT_TYPES[@]}"
+	then
+		PARTITIONING_BOOT_TYPE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_BOOT_DEVICE_tag()   { echo " ├ Boot Device"; }
+function PARTITIONING_BOOT_DEVICE_label() {
+	local devshort=$PARTITIONING_BOOT_DEVICE
+	devshort=$(shorten_device "$devshort")
+	if [[ -e "$PARTITIONING_BOOT_DEVICE" ]]; then
+		echo " ├ ($devshort)"
+	else
+		echo " ├ (\Z1$devshort\Zn)"
+	fi
+}
+function PARTITIONING_BOOT_DEVICE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "existing_partitions"; }
+function PARTITIONING_BOOT_DEVICE_help()  { echo "The device to use for the boot partition. For EFI systems this is the efi partition. Must be formatted already."; }
+function PARTITIONING_BOOT_DEVICE_menu()  {
+	if menu_select_device \
+		"Select boot device" \
+		"Select the device containing the EFI filesystem or /boot partition respectively for systems using efi or bios boot." \
+		"$PARTITIONING_BOOT_DEVICE"
+	then
+		PARTITIONING_BOOT_DEVICE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_USE_SWAP_tag()   { echo " ├ Use swap"; }
+function PARTITIONING_USE_SWAP_label() { on_off_label "$PARTITIONING_USE_SWAP" " ├ "; }
+function PARTITIONING_USE_SWAP_show()  { [[ $PARTITIONING_SCHEME != "custom" && $PARTITIONING_SCHEME != "manual" ]]; }
+function PARTITIONING_USE_SWAP_help()  { echo "Select whether or not to create a swap partition."; }
+function PARTITIONING_USE_SWAP_menu()  {
+	on_off_toggle "PARTITIONING_USE_SWAP"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_SWAP_tag()   { echo " │  └ Swap amount"; }
+function PARTITIONING_SWAP_label() {
+	if [[ $PARTITIONING_SWAP == "auto" ]]; then
+		echo " │  └ (automatic: $(format_mib "$(plan_swap_mib auto)"))"
+	else
+		echo " │  └ ($PARTITIONING_SWAP)"
+	fi
+}
+function PARTITIONING_SWAP_show()  { [[ $PARTITIONING_SCHEME != "custom" && $PARTITIONING_SCHEME != "manual" ]] && is_on "$PARTITIONING_USE_SWAP" && ! one_of "$PARTITIONING_SCHEME" "existing_partitions"; }
+function PARTITIONING_SWAP_help()  { echo "How much swap to create. 'Automatic' sizes it from the RAM of this machine: twice the RAM for up to 2 GiB, as much as the RAM up to 8 GiB, and 8 GiB above that. Swap also helps when compiling large packages."; }
+function PARTITIONING_SWAP_menu()  {
+	local mode="custom"
+	[[ $PARTITIONING_SWAP == "auto" ]] && mode="auto"
+	menu_radiolist_labeled \
+		"Swap size" \
+		"How big should the swap partition be?" \
+		"$mode" \
+		"auto"   "Automatic, based on RAM ($(format_mib "$(plan_swap_mib auto)") on this machine)" \
+		"custom" "Custom size" \
+		|| return 0
+	if [[ $dialog_out == "auto" ]]; then
+		PARTITIONING_SWAP="auto"
+		UNSAVED_CHANGES=true
+		return 0
+	fi
+	local default="$PARTITIONING_SWAP"
+	[[ $default == "auto" ]] && default="8GiB"
+	while true; do
+		dialog \
+			--title "Swap size" \
+			--inputbox "Enter the amount of swap for the new system, with a unit (e.g. 16GiB, 4096MiB)." \
+			"${INPUTBOX_SIZE[@]}" "$default" \
+			|| return 0
+		if size_to_mib "$dialog_out" >/dev/null; then
+			PARTITIONING_SWAP="$dialog_out"
+			UNSAVED_CHANGES=true
+			return 0
+		fi
+		default="$dialog_out"
+		dialog --msgbox "'$dialog_out' is not a valid size. Use a number with a unit, like 8GiB or 512MiB." 7 60
+	done
+}
+
+
+function PARTITIONING_SWAP_DEVICE_tag()   { echo " │  └ Swap Device"; }
+function PARTITIONING_SWAP_DEVICE_label() {
+	local dev=${PARTITIONING_SWAP_DEVICE:-/dev/sdB}
+	local devshort
+	devshort=$(shorten_device "$dev")
+	if [[ -e "$dev" ]]; then
+		echo " │  └ ($devshort)"
+	else
+		echo " │  └ (\Z1$devshort\Zn)"
+	fi
+}
+function PARTITIONING_SWAP_DEVICE_show()  { [[ $PARTITIONING_SCHEME != "custom" && $PARTITIONING_SCHEME != "manual" ]] && is_on "$PARTITIONING_USE_SWAP" && one_of "$PARTITIONING_SCHEME" "existing_partitions"; }
+function PARTITIONING_SWAP_DEVICE_help()  { echo "The device to use as swap."; }
+function PARTITIONING_SWAP_DEVICE_menu()  {
+	if menu_select_device \
+		"Select swap device" \
+		"Select the device to use as swap." \
+		"$PARTITIONING_SWAP_DEVICE"
+	then
+		PARTITIONING_SWAP_DEVICE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_ROOT_FS_tag()   { echo " ├ Root filesystem"; }
+function PARTITIONING_ROOT_FS_label() { echo " ├ ($PARTITIONING_ROOT_FS)"; }
+function PARTITIONING_ROOT_FS_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "classic_single_disk" "raid0_luks"; }
+function PARTITIONING_ROOT_FS_help()  { echo "Select the amount of swap to use."; }
+function PARTITIONING_ROOT_FS_menu()  {
+	if menu_radiolist \
+		"Select root fstype" \
+		"Select which filesystem to use on the root partition." \
+		"$PARTITIONING_ROOT_FS" \
+		"${PARTITIONING_ROOT_FS_TYPES[@]}"
+	then
+		PARTITIONING_ROOT_FS="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_USE_LUKS_tag()   { echo " ├ LUKS Encryption"; }
+function PARTITIONING_USE_LUKS_label() { on_off_label "$PARTITIONING_USE_LUKS" " ├ "; }
+function PARTITIONING_USE_LUKS_show()  { return 1; }  # not supported by the Exherbo installer yet
+function PARTITIONING_USE_LUKS_help()  { echo "Determines if LUKS will be used to encrypt your root partition. You can export the desired encryption key via export GENTOO_INSTALL_ENCRYPTION_KEY='...' before installing if you don't want to be asked."; }
+function PARTITIONING_USE_LUKS_menu()  {
+	on_off_toggle "PARTITIONING_USE_LUKS"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_ZFS_USE_ENCRYPTION_tag()   { echo " ├ ZFS Encryption"; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_label() { on_off_label "$PARTITIONING_ZFS_USE_ENCRYPTION" " ├ "; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric" && one_of "$PARTITIONING_ZFS_POOL_TYPE" "standard"; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_help()  { echo "Determines if ZFS encryption will be used to encrypt your root partition. You can export the desired encryption key via export GENTOO_INSTALL_ENCRYPTION_KEY='...' before installing if you don't want to be asked."; }
+function PARTITIONING_ZFS_USE_ENCRYPTION_menu()  {
+	on_off_toggle "PARTITIONING_ZFS_USE_ENCRYPTION"
+	UNSAVED_CHANGES=true
+}
+
+# TODO keylocation prompt | file
+# TODO if loc is file, another checkbox to "autogenerate and save new key" openssl rand -hex 32 > file
+
+function PARTITIONING_ZFS_USE_COMPRESSION_tag()   { echo " ├ Use ZFS Compression"; }
+function PARTITIONING_ZFS_USE_COMPRESSION_label() { on_off_label "$PARTITIONING_ZFS_USE_COMPRESSION" " ├ "; }
+function PARTITIONING_ZFS_USE_COMPRESSION_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric" && one_of "$PARTITIONING_ZFS_POOL_TYPE" "standard"; }
+function PARTITIONING_ZFS_USE_COMPRESSION_help()  { echo "Determines if compression should be enabled on the ZFS datasets."; }
+function PARTITIONING_ZFS_USE_COMPRESSION_menu()  {
+	on_off_toggle "PARTITIONING_ZFS_USE_COMPRESSION"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_ZFS_COMPRESSION_tag()   { echo " │  └ Compression algorithm"; }
+function PARTITIONING_ZFS_COMPRESSION_label() { echo " │  └ ($PARTITIONING_ZFS_COMPRESSION)"; }
+function PARTITIONING_ZFS_COMPRESSION_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric" && one_of "$PARTITIONING_ZFS_POOL_TYPE" "standard" && is_on "$PARTITIONING_ZFS_USE_COMPRESSION"; }
+function PARTITIONING_ZFS_COMPRESSION_help()  { echo "Determines the compression algorithm used on the ZFS datasets. 'on' means to use the default compression algorithm determined by ZFS. If you need more granular control over the specific levels such as gzip-N or zstd-N, please use a custom pool."; }
+function PARTITIONING_ZFS_COMPRESSION_menu()  {
+	if menu_radiolist \
+		"Select ZFS compression algorithm" \
+		"Determines the compression algorithm used on the ZFS datasets. The special value 'on' means to use the default compression algorithm as determined by ZFS." \
+		"$PARTITIONING_ZFS_COMPRESSION" \
+		"${PARTITIONING_ZFS_COMPRESSIONS[@]}"
+	then
+		PARTITIONING_ZFS_COMPRESSION="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_ZFS_POOL_TYPE_tag()   { echo " ├ Pool type"; }
+function PARTITIONING_ZFS_POOL_TYPE_label() { echo " ├ ($PARTITIONING_ZFS_POOL_TYPE)"; }
+function PARTITIONING_ZFS_POOL_TYPE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "zfs_centric"; }
+function PARTITIONING_ZFS_POOL_TYPE_help()  { echo "Determines how the zfs pool will be initialized. Select 'standard' for a default pool setup that puts all given devices in one pool with ZSTD compression. Selecting 'custom' will require you to write your own pool creation function in the output config."; }
+function PARTITIONING_ZFS_POOL_TYPE_menu()  {
+	if menu_radiolist \
+		"Select ZFS pool type" \
+		"Select 'standard' for a default pool setup that puts all given devices in one pool with ZSTD compression. Selecting 'custom' will require you to write your own pool creation function in the output config." \
+		"$PARTITIONING_ZFS_POOL_TYPE" \
+		"${PARTITIONING_ZFS_POOL_TYPES[@]}"
+	then
+		PARTITIONING_ZFS_POOL_TYPE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_BTRFS_RAID_TYPE_tag()   { echo " ├ Btrfs raid type"; }
+function PARTITIONING_BTRFS_RAID_TYPE_label() { echo " ├ ($PARTITIONING_BTRFS_RAID_TYPE)"; }
+function PARTITIONING_BTRFS_RAID_TYPE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "btrfs_centric"; }
+function PARTITIONING_BTRFS_RAID_TYPE_help()  { echo "Determines the type of the btrfs pool."; }
+function PARTITIONING_BTRFS_RAID_TYPE_menu()  {
+	if menu_radiolist \
+		"Select raid type" \
+		"Select which raid type to use for the btrfs pool." \
+		"$PARTITIONING_BTRFS_RAID_TYPE" \
+		"${PARTITIONING_BTRFS_RAID_TYPES[@]}"
+	then
+		PARTITIONING_BTRFS_RAID_TYPE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_DEVICE_tag()   { echo " ├ Disk"; }
+function PARTITIONING_DEVICE_label() {
+	local devshort=$PARTITIONING_DEVICE
+	devshort=$(shorten_device "$devshort")
+	if [[ -e "$PARTITIONING_DEVICE" ]]; then
+		echo " ├ ($devshort)"
+	else
+		echo " ├ (\Z1$devshort\Zn)"
+	fi
+}
+function PARTITIONING_DEVICE_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "classic_single_disk" "existing_partitions" "manual"; }
+function PARTITIONING_DEVICE_help()  { echo "The block device to which the layout will be applied."; }
+function PARTITIONING_DEVICE_menu()  {
+	if menu_select_device \
+		"Select root device" \
+		"Select the device to use as the root device." \
+		"$PARTITIONING_DEVICE"
+	then
+		PARTITIONING_DEVICE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function PARTITIONING_DEVICES_tag()   { echo " ├ Disks"; }
+function PARTITIONING_DEVICES_label() {
+	local invalid=0
+	for dev in "${PARTITIONING_DEVICES[@]}"; do
+		[[ -e "$dev" ]] \
+			|| ((++invalid))
+	done
+
+	if [[ "$invalid" -gt 0 ]]; then
+		echo " ├ (${#PARTITIONING_DEVICES[@]} devices, \Z1$invalid invalid\Zn)"
+	elif [[ "${#PARTITIONING_DEVICES[@]}" -eq 1 && "$PARTITIONING_SCHEME" == "raid0_luks" ]]; then
+		echo " ├ (${#PARTITIONING_DEVICES[@]} devices, \Z1need at least 2\Zn)"
+	elif [[ "${#PARTITIONING_DEVICES[@]}" -eq 0 ]]; then
+		echo " ├ (${#PARTITIONING_DEVICES[@]} devices, \Z1need at least 1\Zn)"
+	else
+		echo " ├ (${#PARTITIONING_DEVICES[@]} devices)"
+	fi
+}
+function PARTITIONING_DEVICES_show()  { [[ $PARTITIONING_SCHEME != "custom" ]] && one_of "$PARTITIONING_SCHEME" "raid0_luks" "zfs_centric" "btrfs_centric"; }
+function PARTITIONING_DEVICES_help()  { echo "The block devices to which the layout will be applied."; }
+function PARTITIONING_DEVICES_menu()  {
+	local invalid=()
+	for dev in "${PARTITIONING_DEVICES[@]}"; do
+		[[ -e "$dev" ]] \
+			|| invalid+=("$dev")
+	done
+
+	local invalid_line=""
+	if [[ "${#invalid[@]}" -gt 0 ]]; then
+		invalid_line="\n\nInvalid devices: \Z1${invalid[*]}\Zn"
+	fi
+
+	dialog \
+		--title "Select devices" \
+		--inputbox "Enter the path of all devices which you want to partition, separated by space. (e.g. /dev/sda /dev/sdb).$invalid_line" \
+		"${INPUTBOX_SIZE[@]}" "${PARTITIONING_DEVICES[*]}" \
+		|| return 0
+	read -ra PARTITIONING_DEVICES <<< "$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function HOSTNAME_tag()   { echo "Hostname"; }
+function HOSTNAME_label() { echo "($HOSTNAME)"; }
+function HOSTNAME_show()  { return 0; }
+function HOSTNAME_help()  { echo "Enter the desired system hostname here. Be aware that when creating mdadm raid arrays, this value will be recorded in metadata block. If you change it later, you should also update the metadata."; }
+function HOSTNAME_menu()  {
+	dialog \
+		--title "Select hostname" \
+		--inputbox "Enter the hostname for your new system." \
+		"${INPUTBOX_SIZE[@]}" "$HOSTNAME" \
+		|| return 0
+	HOSTNAME="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function TIMEZONE_tag()   { echo "Timezone"; }
+function TIMEZONE_label() { echo "($TIMEZONE)"; }
+function TIMEZONE_show()  { return 0; }
+function TIMEZONE_help()  { echo "The timezone for the new system."; }
+function TIMEZONE_menu()  {
+	if menu_radiolist \
+		"Select timezone" \
+		"Select which timezone to use." \
+		"$TIMEZONE" \
+		"${ALL_TIMEZONES[@]}"
+	then
+		TIMEZONE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function KEYMAP_tag()   { echo "Keymap"; }
+function KEYMAP_label() { echo "($KEYMAP)"; }
+function KEYMAP_show()  { return 0; }
+function KEYMAP_help()  { echo "The default vconsole keymap for the system."; }
+function KEYMAP_menu()  {
+	if menu_radiolist \
+		"Select initramfs keymap" \
+		"Select which keymap to use in the vconsole." \
+		"$KEYMAP" \
+		"${ALL_KEYMAPS[@]}"
+	then
+		KEYMAP="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function KEYMAP_INITRAMFS_OTHER_tag()   { echo "Different initramfs keymap"; }
+function KEYMAP_INITRAMFS_OTHER_label() { on_off_label "$KEYMAP_INITRAMFS_OTHER"; }
+function KEYMAP_INITRAMFS_OTHER_show()  { return 0; }
+function KEYMAP_INITRAMFS_OTHER_help()  { echo "Whether another keymap should be used for the initramfs. If enabled, you will be able to choose a separate keymap below."; }
+function KEYMAP_INITRAMFS_OTHER_menu()  {
+	on_off_toggle "KEYMAP_INITRAMFS_OTHER"
+	UNSAVED_CHANGES=true
+	[[ -z $KEYMAP_INITRAMFS ]] \
+		&& KEYMAP_INITRAMFS="$KEYMAP"
+}
+
+function KEYMAP_INITRAMFS_tag()   { echo " └ Keymap (initramfs)"; }
+function KEYMAP_INITRAMFS_label() { echo " └ ($KEYMAP_INITRAMFS)"; }
+function KEYMAP_INITRAMFS_show()  { is_on "$KEYMAP_INITRAMFS_OTHER"; }
+function KEYMAP_INITRAMFS_help()  { echo "The default vconsole keymap for the initrams. This is important if need to unlock an encrypted partition when booting."; }
+function KEYMAP_INITRAMFS_menu()  {
+	if menu_radiolist \
+		"Select initramfs keymap" \
+		"Select which keymap to use in the initramfs vconsole." \
+		"$KEYMAP_INITRAMFS" \
+		"${ALL_KEYMAPS[@]}"
+	then
+		KEYMAP_INITRAMFS="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function LOCALES_tag()   { echo "Locales"; }
+function LOCALES_label() { echo "$N_LOCALES selected"; }
+function LOCALES_show()  { return 0; }
+function LOCALES_help()  { echo "The locales to generate for the new system. Be careful that the syntax for locales is a different from the resulting name of the genereated locales of locale-gen. For example the locale 'en_US.utf8' is enabled via 'en_US.UTF-8 UTF-8')."; }
+function LOCALES_menu()  {
+	if menu_splitlist "Select locales" "Select which locales to generate." "$SELECTED_LOCALES" "${SUPPORTED_LOCALES[@]}"; then
+		SELECTED_LOCALES="$dialog_out"
+		recalculate_locales
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+function LOCALE_tag()   { echo "Default locale"; }
+function LOCALE_label() { echo "($LOCALE)"; }
+function LOCALE_show()  { return 0; }
+function LOCALE_help()  { echo "The locale to use for the new system. See \`locale -a\` for available options, and be sure to generate the locale by adding it to the list of locales above."; }
+function LOCALE_menu()  {
+	if menu_radiolist \
+		"Select default locale" \
+		"Select which locale to use as the default. Remember to also add the desired locale to the list of locales above." \
+		"$LOCALE" \
+		"${LOCALE_A[@]}"
+	then
+		LOCALE="$dialog_out"
+		UNSAVED_CHANGES=true
+	else
+		# Return to menu
+		true
+	fi
+}
+
+# ---- Accounts ----------------------------------------------------------
+
+function ROOT_PASSWORD_MODE_tag()   { echo "Root account"; }
+function ROOT_PASSWORD_MODE_label() {
+	case "$ROOT_PASSWORD_MODE" in
+		set)    echo "(password)" ;;
+		locked) echo "(locked, use sudo)" ;;
+		ask)    echo "(ask during install)" ;;
+	esac
+}
+function ROOT_PASSWORD_MODE_show()  { return 0; }
+function ROOT_PASSWORD_MODE_help()  { echo "How the root account is handled. 'password' stores a salted SHA-512 hash of the password you enter here (never the password itself). 'locked' disables root login completely; you then administer the system with sudo from your user account (a user is required). 'ask' prompts for the root password when the installation starts."; }
+function ROOT_PASSWORD_MODE_menu()  {
+	if menu_radiolist_labeled \
+		"Root account" \
+		"How should the root account be set up?" \
+		"$ROOT_PASSWORD_MODE" \
+		"set"    "Set a root password now" \
+		"locked" "Lock root, administer via sudo (needs a user account)" \
+		"ask"    "Ask for the root password during the installation"
+	then
+		ROOT_PASSWORD_MODE="$dialog_out"
+		UNSAVED_CHANGES=true
+	fi
+}
+
+# $1: title, $2: variable name receiving the hash
+function ask_password_hash() {
+	local title="$1" var="$2" pw1 pw2
+	type openssl &>/dev/null \
+		|| { dialog --msgbox "openssl is required to hash passwords, but is not installed in this environment." 7 60; return 1; }
+	while true; do
+		dialog --insecure --title "$title" --passwordbox "Enter a password (at least 6 characters). Leave empty to cancel." 9 "${INPUTBOX_SIZE[1]}" \
+			|| return 1
+		pw1="$dialog_out"
+		[[ -n $pw1 ]] || return 1
+		if [[ ${#pw1} -lt 6 ]]; then
+			dialog --msgbox "The password must be at least 6 characters long." 7 56
+			continue
+		fi
+		dialog --insecure --title "$title" --passwordbox "Repeat the password." 9 "${INPUTBOX_SIZE[1]}" \
+			|| return 1
+		pw2="$dialog_out"
+		if [[ $pw1 != "$pw2" ]]; then
+			dialog --msgbox "The passwords do not match. Please try again." 7 56
+			continue
+		fi
+		declare -g "$var"="$(hash_password "$pw1")"
+		return 0
+	done
+}
+
+function ROOT_PASSWORD_tag()   { echo " └ Root password"; }
+function ROOT_PASSWORD_label() { echo " └ ($([[ -n $ROOT_PASSWORD_HASH ]] && echo "set" || echo "\Z1not set\Zn"))"; }
+function ROOT_PASSWORD_show()  { [[ $ROOT_PASSWORD_MODE == "set" ]]; }
+function ROOT_PASSWORD_help()  { echo "The root password. Only a salted SHA-512 hash is written to the configuration file. If you leave it unset, the installer asks for the password when it runs."; }
+function ROOT_PASSWORD_menu()  {
+	ask_password_hash "Root password" ROOT_PASSWORD_HASH \
+		&& UNSAVED_CHANGES=true
+}
+
+function USER_NAME_tag()   { echo "User account"; }
+function USER_NAME_label() { echo "($([[ -n $USER_NAME ]] && echo "$USER_NAME" || echo "none"))"; }
+function USER_NAME_show()  { return 0; }
+function USER_NAME_help()  { echo "Creates a regular user with a home directory, in the groups wheel, audio, video, usb, plugdev, input and render (where they exist). Leave empty to create no user."; }
+function USER_NAME_menu()  {
+	dialog \
+		--title "User account" \
+		--inputbox "Enter the user name (lowercase letters, digits, - and _). Leave empty for no user." \
+		"${INPUTBOX_SIZE[@]}" "$USER_NAME" \
+		|| return 0
+	local name="$dialog_out"
+	if [[ -n $name && ! $name =~ ^[a-z_][a-z0-9_-]{0,31}$ || $name == "root" ]]; then
+		dialog --msgbox "'$name' is not a valid user name." 7 56
+		return 0
+	fi
+	USER_NAME="$name"
+	UNSAVED_CHANGES=true
+}
+
+function USER_PASSWORD_tag()   { echo " ├ Password"; }
+function USER_PASSWORD_label() { echo " ├ ($([[ -n $USER_PASSWORD_HASH ]] && echo "set" || echo "\Z1not set\Zn"))"; }
+function USER_PASSWORD_show()  { [[ -n $USER_NAME ]]; }
+function USER_PASSWORD_help()  { echo "The password of the user account. Only a salted SHA-512 hash is written to the configuration file. If you leave it unset, the installer asks for the password when it runs."; }
+function USER_PASSWORD_menu()  {
+	ask_password_hash "Password for $USER_NAME" USER_PASSWORD_HASH \
+		&& UNSAVED_CHANGES=true
+}
+
+function USER_SUDO_tag()   { echo " └ Administrator (sudo)"; }
+function USER_SUDO_label() { on_off_label "$USER_SUDO" " └ "; }
+function USER_SUDO_show()  { [[ -n $USER_NAME ]]; }
+function USER_SUDO_help()  { echo "Installs sudo and lets members of the wheel group run commands as root (after entering their own password). The user is always added to wheel; this option controls whether sudo is installed and configured."; }
+function USER_SUDO_menu()  {
+	on_off_toggle "USER_SUDO"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_BTRFS_SUBVOLUMES_tag()   { echo " ├ Btrfs subvolumes"; }
+function PARTITIONING_BTRFS_SUBVOLUMES_label() { on_off_label "$PARTITIONING_BTRFS_SUBVOLUMES" " ├ "; }
+function PARTITIONING_BTRFS_SUBVOLUMES_show()  { [[ $PARTITIONING_SCHEME == "classic_single_disk" && $PARTITIONING_ROOT_FS == "btrfs" ]]; }
+function PARTITIONING_BTRFS_SUBVOLUMES_help()  { echo "Splits the btrfs root into subvolumes: / (root), /home, /.snapshots, /var/log and /var/cache. Home and logs can then be snapshotted or rolled back separately, and even with LUKS everything is encrypted by a single passphrase. All subvolumes live in one filesystem, so there are no fixed sizes to guess."; }
+function PARTITIONING_BTRFS_SUBVOLUMES_menu()  {
+	on_off_toggle "PARTITIONING_BTRFS_SUBVOLUMES"
+	UNSAVED_CHANGES=true
+}
+
+function PARTITIONING_MANUAL_tag()   { echo " ├ Partition table"; }
+function PARTITIONING_MANUAL_label() {
+	manual_validate
+	if [[ ${#PLAN_PROBLEMS[@]} -gt 0 ]]; then
+		echo " ├ (${#PARTITIONING_MANUAL_PARTS[@]} partitions + boot, \Z1needs attention\Zn)"
+	else
+		echo " ├ (${#PARTITIONING_MANUAL_PARTS[@]} partitions + boot)"
+	fi
+}
+function PARTITIONING_MANUAL_show()  { [[ $PARTITIONING_SCHEME == "manual" ]]; }
+function PARTITIONING_MANUAL_help()  { echo "Opens the partition editor: add, resize, reorder and delete partitions, choose mountpoints and filesystems (ext4, btrfs, swap), and encrypt the root partition. The boot partition is always created first. Only one disk is used and it is erased completely."; }
+function PARTITIONING_MANUAL_menu()  {
+	UNSAVED_CHANGES=true
+	PARTITIONING_MANUAL_menu_editor
+}
+
+function PARTITIONING_PLAN_tag()   { echo " └ Preview layout"; }
+function PARTITIONING_PLAN_label() { echo " └ (what will happen to the disk)"; }
+function PARTITIONING_PLAN_show()  { [[ $PARTITIONING_SCHEME != "custom" ]]; }
+function PARTITIONING_PLAN_help()  { echo "Shows the partitions, sizes, filesystems and mountpoints that the current settings will create, and warns about problems such as a missing disk or not enough space."; }
+function PARTITIONING_PLAN_menu()  { show_partition_plan; }
+
+# ---- Bootloader --------------------------------------------------------
+
+function BOOTLOADER_tag()   { echo "Bootloader"; }
+function BOOTLOADER_label() {
+	if [[ $PARTITIONING_BOOT_TYPE == "bios" ]]; then
+		echo "(syslinux - BIOS)"
+	else
+		echo "($BOOTLOADER)"
+	fi
+}
+function BOOTLOADER_show()  { return 0; }
+function BOOTLOADER_help()  { echo "EFI installs can use systemd-boot (simple, default) or GRUB (more familiar, handles many setups). Both are kept up to date automatically when kernels are upgraded (installkernel + dracut). BIOS installs always use syslinux."; }
+function BOOTLOADER_menu()  {
+	if [[ $PARTITIONING_BOOT_TYPE == "bios" ]]; then
+		dialog --msgbox "BIOS installs always use syslinux. Switch the boot type to EFI (and enable EFI/UEFI in your VM or firmware) to choose GRUB or systemd-boot." 9 64
+		return 0
+	fi
+	if menu_radiolist_labeled \
+		"Bootloader" \
+		"Select the EFI bootloader." \
+		"$BOOTLOADER" \
+		"systemd-boot" "systemd-boot (default, simple)" \
+		"grub"         "GRUB 2"
+	then
+		BOOTLOADER="$dialog_out"
+		UNSAVED_CHANGES=true
+	fi
+}
+
+# ---- Desktop -----------------------------------------------------------
+
+function desktop_name() {
+	case "$DESKTOP" in
+		none)   echo "none (console only)" ;;
+		plasma) echo "KDE Plasma" ;;
+	esac
+}
+
+function DESKTOP_tag()   { echo "Desktop environment"; }
+function DESKTOP_label() { echo "($(desktop_name))"; }
+function DESKTOP_show()  { return 0; }
+function DESKTOP_help()  { echo "Installs KDE Plasma with 'cave resolve plasma' (the documented Exherbo way) and the SDDM login screen. Exherbo has no binary packages, so this compiles hundreds of packages and can take a day on a slow machine. Choose 'None' to get a minimal system first and add a desktop later with cave."; }
+function DESKTOP_menu()  {
+	local prev_desktop="$DESKTOP"
+	if menu_radiolist_labeled \
+		"Desktop environment" \
+		"Select the desktop environment to install." \
+		"$DESKTOP" \
+		"none"   "None - console only (minimal system)" \
+		"plasma" "KDE Plasma (SDDM) - compiled from source, takes many hours"
+	then
+		DESKTOP="$dialog_out"
+		UNSAVED_CHANGES=true
+		[[ $DESKTOP == "none" ]] && DISPLAY_MANAGER="auto"
+		if [[ $DESKTOP != "none" && $NETWORK_BACKEND != "networkmanager" ]]; then
+			if dialog --yesno "Desktops are easiest to use with NetworkManager (graphical Wi-Fi/VPN settings). Switch the network setup to NetworkManager?" 8 64; then
+				NETWORK_BACKEND="networkmanager"
+			fi
+		fi
+	fi
+}
+
+function DISPLAY_MANAGER_tag()   { echo " ├ Login screen (greeter)"; }
+function DISPLAY_MANAGER_label() { echo " ├ ($(display_manager_name))"; }
+function DISPLAY_MANAGER_show()  { [[ $DESKTOP != "none" ]]; }
+function display_manager_name() {
+	case "$DISPLAY_MANAGER" in
+		auto)
+			case "$DESKTOP" in
+				plasma) echo "auto: SDDM" ;;
+				*)      echo "auto" ;;
+			esac ;;
+		sddm)           echo "SDDM" ;;
+	esac
+}
+function DISPLAY_MANAGER_help()  { echo "The graphical login screen. Only SDDM (KDE's) is supported. If the package cannot be found in the Exherbo repositories, the system boots to a text login and 'startplasma-wayland' can be started by hand."; }
+function DISPLAY_MANAGER_menu()  {
+	local items=(
+		"auto"    "Automatic (matches the desktop)"
+		"sddm"    "SDDM (KDE's login screen)"
+	)
+	if menu_radiolist_labeled \
+		"Login screen" \
+		"Select the graphical login screen (display manager / greeter)." \
+		"$DISPLAY_MANAGER" \
+		"${items[@]}"
+	then
+		DISPLAY_MANAGER="$dialog_out"
+		UNSAVED_CHANGES=true
+	fi
+}
+
+# ---- Network -----------------------------------------------------------
+
+function NETWORK_BACKEND_tag()   { echo "Network"; }
+function NETWORK_BACKEND_label() {
+	case "$NETWORK_BACKEND" in
+		iwd)            echo "(iwd / iwctl)" ;;
+		networkmanager) echo "(NetworkManager)" ;;
+		wired)          echo "(wired only)" ;;
+	esac
+}
+function NETWORK_BACKEND_show()  { return 0; }
+function NETWORK_BACKEND_help()  { echo "How the installed system connects to the network. 'iwd' installs iwd: connect to Wi-Fi with 'iwctl' (like on the Arch live ISO); ethernet works automatically via DHCP. 'NetworkManager' is the usual choice for desktops (graphical settings). 'wired only' sets up ethernet (DHCP or static IP) and no Wi-Fi."; }
+function NETWORK_BACKEND_menu()  {
+	if menu_radiolist_labeled \
+		"Network" \
+		"How should networking be set up on the new system?" \
+		"$NETWORK_BACKEND" \
+		"iwd"            "iwd - Wi-Fi via iwctl, ethernet via DHCP" \
+		"networkmanager" "NetworkManager - best for desktops" \
+		"wired"          "Wired only - DHCP or static IP, no Wi-Fi"
+	then
+		NETWORK_BACKEND="$dialog_out"
+		UNSAVED_CHANGES=true
+	fi
+}
+
+function COPY_LIVE_WIFI_tag()   { echo " ├ Copy live Wi-Fi networks"; }
+function COPY_LIVE_WIFI_label() { on_off_label "$COPY_LIVE_WIFI" " ├ "; }
+function COPY_LIVE_WIFI_show()  { [[ $NETWORK_BACKEND == "iwd" ]]; }
+function COPY_LIVE_WIFI_help()  { echo "Copies the Wi-Fi networks (and their passwords) you connected to with iwctl in this live environment to the new system, so it connects right after the first boot. Only works if the live system uses iwd (like the Arch ISO)."; }
+function COPY_LIVE_WIFI_menu()  {
+	on_off_toggle "COPY_LIVE_WIFI"
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_INTERFACE_NAME_tag()   { echo " ├ Interface Name"; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_label() { echo " ├ ($(ellipsis 20 "$SYSTEMD_NETWORKD_INTERFACE_NAME"))"; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_show()  { [[ $STAGE3_VARIANT == *systemd* && $NETWORK_BACKEND == "wired" ]]; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_help()  { echo "The network interface(s) to configure. Defaults to all interfaces matching en*."; }
+function SYSTEMD_NETWORKD_INTERFACE_NAME_menu()  {
+	dialog \
+		--title "Network Interface Name" \
+		--inputbox "Enter the network interface name which should be configured. Can include wildcards." \
+		"${INPUTBOX_SIZE[@]}" "$SYSTEMD_NETWORKD_INTERFACE_NAME" \
+		|| return 0
+	SYSTEMD_NETWORKD_INTERFACE_NAME="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_DHCP_tag()   { echo " └ Static IP"; }
+function SYSTEMD_NETWORKD_DHCP_label() { on_off_label_inverted "$SYSTEMD_NETWORKD_DHCP" " └ "; }
+function SYSTEMD_NETWORKD_DHCP_show()  { [[ $STAGE3_VARIANT == *systemd* && $NETWORK_BACKEND == "wired" ]]; }
+function SYSTEMD_NETWORKD_DHCP_help()  { echo "Use DHCP to obtain network configuration."; }
+function SYSTEMD_NETWORKD_DHCP_menu()  {
+	on_off_toggle "SYSTEMD_NETWORKD_DHCP"
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_ADDRESSES_tag()   { echo "   ├ Addresses"; }
+function SYSTEMD_NETWORKD_ADDRESSES_label() { echo "   ├ ($(ellipsis 20 "${SYSTEMD_NETWORKD_ADDRESSES[*]}"))"; }
+function SYSTEMD_NETWORKD_ADDRESSES_show()  { [[ $STAGE3_VARIANT == *systemd* && $NETWORK_BACKEND == "wired" ]] && is_off "$SYSTEMD_NETWORKD_DHCP"; }
+function SYSTEMD_NETWORKD_ADDRESSES_help()  { echo "A space-separated list of addresses with CIDR mask to assign to the network interface."; }
+function SYSTEMD_NETWORKD_ADDRESSES_menu()  {
+	dialog \
+		--title "Network Addresses" \
+		--inputbox "A space-separated list of addresses with CIDR mask to assign to the network interface." \
+		"${INPUTBOX_SIZE[@]}" "${SYSTEMD_NETWORKD_ADDRESSES[*]}" \
+		|| return 0
+	# shellcheck disable=SC2206
+	SYSTEMD_NETWORKD_ADDRESSES=($dialog_out)
+	UNSAVED_CHANGES=true
+}
+
+function SYSTEMD_NETWORKD_GATEWAY_tag()   { echo "   └ Gateway"; }
+function SYSTEMD_NETWORKD_GATEWAY_label() { echo "   └ ($(ellipsis 20 "$SYSTEMD_NETWORKD_GATEWAY"))"; }
+function SYSTEMD_NETWORKD_GATEWAY_show()  { [[ $STAGE3_VARIANT == *systemd* && $NETWORK_BACKEND == "wired" ]] && is_off "$SYSTEMD_NETWORKD_DHCP"; }
+function SYSTEMD_NETWORKD_GATEWAY_help()  { echo "The gateway address for the network."; }
+function SYSTEMD_NETWORKD_GATEWAY_menu()  {
+	dialog \
+		--title "Network Gateway" \
+		--inputbox "The gateway address for the network." \
+		"${INPUTBOX_SIZE[@]}" "$SYSTEMD_NETWORKD_GATEWAY" \
+		|| return 0
+	SYSTEMD_NETWORKD_GATEWAY="$dialog_out"
+	UNSAVED_CHANGES=true
+}
+
+function KERNEL_CONFIG_tag()   { echo "Kernel configuration"; }
+function KERNEL_CONFIG_label() { echo "($KERNEL_CONFIG)"; }
+function KERNEL_CONFIG_show()  { return 0; }
+function KERNEL_CONFIG_help()  { echo "Exherbo has no distribution kernel, so the latest stable Linux kernel is built during the install, starting from the configuration of the running live system. 'live' keeps only the modules the live system is using right now (localmodconfig): a fast build that matches this machine, but hardware that is not active in the live system (e.g. an unplugged device) may lack a driver. 'full' keeps the whole module set: complete hardware support but a much longer build (hours)."; }
+function KERNEL_CONFIG_menu()  {
+	if menu_radiolist_labeled \
+		"Kernel configuration" \
+		"How should the kernel be configured?" \
+		"$KERNEL_CONFIG" \
+		"live" "Trimmed to this machine's hardware (fast, recommended)" \
+		"full" "Full module set (hardware-complete, much slower build)"
+	then
+		KERNEL_CONFIG="$dialog_out"
+		UNSAVED_CHANGES=true
+	fi
+}
+
+function ADDITIONAL_PACKAGES_tag()   { echo "Additional packages"; }
+function ADDITIONAL_PACKAGES_label() { echo "${#ADDITIONAL_PACKAGES[@]} packages"; }
+function ADDITIONAL_PACKAGES_show()  { return 0; }
+function ADDITIONAL_PACKAGES_help()  { echo "Enter additional packages that should be installed. It is recommended to keep this to a minimum, because every package is compiled from source. Use cave package specs, e.g. "sys-apps/htop" or just "htop"."; }
+function ADDITIONAL_PACKAGES_menu()  {
+	dialog \
+		--title "Additional packages" \
+		--inputbox "Enter additional packages (portage package ATOMs) to install. Delimited by space." \
+		"${INPUTBOX_SIZE[@]}" "${ADDITIONAL_PACKAGES[*]}"
+	# shellcheck disable=SC2206
+	ADDITIONAL_PACKAGES=($dialog_out)
+	UNSAVED_CHANGES=true
+}
+
+function INSTALL_NOW_tag()   { echo ">> Review and install"; }
+function INSTALL_NOW_label() { echo "(starts ./install)"; }
+function INSTALL_NOW_show()  { return 0; }
+function INSTALL_NOW_help()  { echo "Saves this configuration and starts the installation right away. You will be shown the partitioning plan and asked to confirm before any disk is changed."; }
+function INSTALL_NOW_menu()  {
+	local problems=()
+	[[ $EUID == 0 ]] || problems+=("The installer must be run as root.")
+	if [[ $PARTITIONING_SCHEME == "custom" ]]; then
+		:
+	elif one_of "$PARTITIONING_SCHEME" "classic_single_disk" "manual"; then
+		partition_plan_text >/dev/null
+		local pp
+		for pp in "${PLAN_PROBLEMS[@]}"; do problems+=("$pp"); done
+	elif one_of "$PARTITIONING_SCHEME" "existing_partitions"; then
+		[[ -e $PARTITIONING_DEVICE ]] || problems+=("The target device '$PARTITIONING_DEVICE' does not exist. Choose it under 'Partitioning scheme'.")
+	fi
+	if [[ -z $USER_NAME && $ROOT_PASSWORD_MODE == "locked" ]]; then
+		problems+=("Root is locked and there is no user account: you could never log in.")
+	fi
+	if [[ ${#problems[@]} -gt 0 ]]; then
+		dialog --title "Cannot install yet" --msgbox "$(printf '* %s\n' "${problems[@]}")" 12 "${CONFIRM_SIZE[1]}"
+		return 0
+	fi
+	local review_file
+	review_file="$(mktemp)"
+	review_text > "$review_file"
+	dialog --title " Review " --exit-label "Continue" --textbox "$review_file" "${MENU_SIZE[0]}" "${MENU_SIZE[1]}"
+	rm -f "$review_file"
+	dialog --title "Start installation" --yes-label "Install" --no-label "Back" \
+		--yesno "Save the configuration to $RELA_CONFIG_FILE and start the installation now?\n\nNothing is changed on any disk until you confirm the partitioning plan in the next step." 11 "${CONFIRM_SIZE[1]}" \
+		|| return 0
+	# The installer needs the config inside its own directory (it is also read from within the chroot).
+	local install_conf="$CONFIG_FILE"
+	if [[ $install_conf != "$GENTOO_INSTALL_REPO_DIR"/* ]]; then
+		install_conf="$GENTOO_INSTALL_REPO_DIR/exherbo.conf"
+		if [[ -e $install_conf ]] && ! dialog --defaultno --yesno "The configuration lives outside the installer directory, so it must be copied to $install_conf, which already exists. Overwrite it?" 9 "${CONFIRM_SIZE[1]}"; then
+			return 0
+		fi
+	fi
+	save "$CONFIG_FILE"
+	[[ $install_conf == "$CONFIG_FILE" ]] || save "$install_conf"
+	UNSAVED_CHANGES=false
+	gentoo_theme_reset
+	clear -x
+	exec "$GENTOO_INSTALL_REPO_DIR/install" --config "$install_conf"
+}
+
+
+################################################
+# Menu functions
+
+# $1: filename
+function save() {
+	if [[ "$KEYMAP_INITRAMFS_OTHER" == "false" ]]; then
+		KEYMAP_INITRAMFS="$KEYMAP"
+	fi
+
+	cat > "$1" <<EOF
+# vim: set ft=sh ts=4 sw=4 sts=-1 noet:
+# This file will be interpreted by /bin/bash.
+
+
+################################################
+# Disk configuration
+
+$(define_disk_layout)
+
+
+################################################
+# System configuration
+
+HOSTNAME=${HOSTNAME@Q}
+TIMEZONE=${TIMEZONE@Q}
+KEYMAP=${KEYMAP@Q}
+KEYMAP_INITRAMFS=${KEYMAP_INITRAMFS@Q}
+
+LOCALES=${LOCALES@Q}
+LOCALE=${LOCALE@Q}
+
+NETWORK_BACKEND=${NETWORK_BACKEND@Q}
+COPY_LIVE_WIFI=${COPY_LIVE_WIFI@Q}
+SYSTEMD_NETWORKD_INTERFACE_NAME=${SYSTEMD_NETWORKD_INTERFACE_NAME@Q}
+SYSTEMD_NETWORKD_DHCP=${SYSTEMD_NETWORKD_DHCP@Q}
+SYSTEMD_NETWORKD_ADDRESSES=(${SYSTEMD_NETWORKD_ADDRESSES[@]@Q})
+SYSTEMD_NETWORKD_GATEWAY=${SYSTEMD_NETWORKD_GATEWAY@Q}
+
+
+################################################
+# Accounts (passwords are stored as salted SHA-512 hashes, never in clear text)
+
+ROOT_PASSWORD_MODE=${ROOT_PASSWORD_MODE@Q}
+ROOT_PASSWORD_HASH=${ROOT_PASSWORD_HASH@Q}
+USER_NAME=${USER_NAME@Q}
+USER_PASSWORD_HASH=${USER_PASSWORD_HASH@Q}
+USER_SUDO=${USER_SUDO@Q}
+
+
+################################################
+# Desktop
+
+BOOTLOADER=${BOOTLOADER@Q}
+DESKTOP=${DESKTOP@Q}
+DISPLAY_MANAGER=${DISPLAY_MANAGER@Q}
+
+
+################################################
+# Exherbo configuration
+
+EXHERBO_STAGE_URL=${EXHERBO_STAGE_URL@Q}
+EXHERBO_REPOSITORIES=${EXHERBO_REPOSITORIES@Q}
+KERNEL_CONFIG=${KERNEL_CONFIG@Q}
+SYSTEMD=true
+
+
+################################################
+# Additional (optional) configuration
+
+ADDITIONAL_PACKAGES=(${ADDITIONAL_PACKAGES[@]@Q})
+
+
+################################################
+# Prove that you have read the config
+
+I_HAVE_READ_AND_EDITED_THE_CONFIG_PROPERLY=true
+EOF
+}
+
+trap 'clear_and_exit 130' SIGINT
+
+# Begin menu loop. Exit will be called to end this loop where it is appropriate.
+SELECTED_MENU_ITEM="$(PARTITIONING_SCHEME_tag)"
+while true; do
+	menu
+done

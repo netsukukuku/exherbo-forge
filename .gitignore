@@ -1,0 +1,4 @@
+# Your personal config (contains password hashes and your disk layout)
+exherbo.conf
+*.conf
+!exherbo.conf.example
